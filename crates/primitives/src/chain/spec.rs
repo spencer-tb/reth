@@ -1660,7 +1660,6 @@ Post-merge hard forks (timestamp based):
           "number": "0x0",
           "gasUsed": "0x0",
           "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
-          "baseFeePerGas": "0x3b9aca00"
         }
         "#;
 

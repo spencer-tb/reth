@@ -846,7 +846,8 @@ mod tests {
         "berlinBlock": 0,
         "yolov2Block": 0,
         "yolov3Block": 0,
-        "londonBlock": 0
+        "londonBlock": 0,
+        "mergeNetsplitBlock": 0
       },
       "coinbase": "0x0000000000000000000000000000000000000000",
       "difficulty": "0x30000",

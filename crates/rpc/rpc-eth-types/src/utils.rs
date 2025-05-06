@@ -3,6 +3,7 @@
 use super::{EthApiError, EthResult};
 use reth_primitives_traits::{Recovered, SignedTransaction};
 use std::future::Future;
+use tracing::*;
 
 /// Recovers a [`SignedTransaction`] from an enveloped encoded byte stream.
 ///
@@ -15,8 +16,11 @@ pub fn recover_raw_transaction<T: SignedTransaction>(mut data: &[u8]) -> EthResu
         return Err(EthApiError::EmptyRawTransactionData)
     }
 
-    let transaction =
-        T::decode_2718(&mut data).map_err(|_| EthApiError::FailedToDecodeSignedTransaction)?;
+    let transaction = T::decode_2718(&mut data)
+        .map_err(|err| {
+            trace!(target: "rpc::eth", "raw tx RLP decode failed: {:?}", err);
+            EthApiError::FailedToDecodeSignedTransaction
+        })?;
 
     transaction.try_into_recovered().or(Err(EthApiError::InvalidTransactionSignature))
 }

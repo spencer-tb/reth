@@ -276,6 +276,10 @@ pub enum ConsensusError {
     #[error("missing requests")]
     BodyRequestsMissing,
 
+    /// Error when invalid deposit event data layout in deposit request.
+    #[error("invalid deposit event data layout")]
+    InvalidDepositEventLayout,
+
     /// Error when blob gas used is missing.
     #[error("missing blob gas used")]
     BlobGasUsedMissing,

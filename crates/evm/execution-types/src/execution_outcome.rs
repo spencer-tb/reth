@@ -380,6 +380,42 @@ impl<T: Receipt<Log = Log>> ExecutionOutcome<T> {
     pub fn block_logs_bloom(&self, block_number: BlockNumber) -> Option<Bloom> {
         Some(logs_bloom(self.logs(block_number)?))
     }
+
+    /// Processes receipts to find deposit events and validates them according to 
+    /// EIP-6110 strict layout requirements (576 bytes, exact offsets).
+    pub fn extract_deposit_requests(
+        &self,
+        deposit_contract_address: Address,
+        deposit_event_signature: B256,
+    ) -> Result<Requests, InvalidDepositEventLayout> {
+        let mut deposit_requests = Vec::new();
+
+        // Process all receipts in order
+        for receipt_batch in &self.receipts {
+            for receipt in receipt_batch {
+                for log in receipt.logs() {
+                    // Check if this is a deposit event
+                    if Self::is_deposit_log(log, deposit_contract_address, deposit_event_signature) {
+                        // Apply strict EIP-6110 validation
+                        if !is_valid_deposit_event_data(&log.data.data) {
+                            return Err(InvalidDepositEventLayout);
+                        }
+                        
+                        // Convert log data to deposit request bytes
+                        deposit_requests.push(log.data.data.to_vec().into());
+                    }
+                }
+            }
+        }
+
+        Ok(Requests::new(deposit_requests))
+    }
+
+    fn is_deposit_log(log: &Log, deposit_contract_address: Address, deposit_event_signature: B256) -> bool {
+        log.address == deposit_contract_address &&
+        !log.topics().is_empty() &&
+        log.topics()[0] == deposit_event_signature
+    }
 }
 
 impl ExecutionOutcome {
@@ -987,3 +1023,54 @@ mod tests {
         }));
     }
 }
+
+/// EIP-6110: Validates deposit event data layout
+/// Returns `true` if the deposit event data has the correct 576-byte layout
+/// with exact offsets as specified in EIP-6110
+fn is_valid_deposit_event_data(deposit_event_data: &[u8]) -> bool {
+    // Must be exactly 576 bytes
+    if deposit_event_data.len() != 576 {
+        return false;
+    }
+
+    // Extract offsets from the ABI-encoded data (big-endian u32s)
+    let pubkey_offset = u32::from_be_bytes([
+        deposit_event_data[28], deposit_event_data[29], 
+        deposit_event_data[30], deposit_event_data[31]
+    ]);
+    let withdrawal_credentials_offset = u32::from_be_bytes([
+        deposit_event_data[60], deposit_event_data[61], 
+        deposit_event_data[62], deposit_event_data[63]
+    ]);
+    let amount_offset = u32::from_be_bytes([
+        deposit_event_data[92], deposit_event_data[93], 
+        deposit_event_data[94], deposit_event_data[95]
+    ]);
+    let signature_offset = u32::from_be_bytes([
+        deposit_event_data[124], deposit_event_data[125], 
+        deposit_event_data[126], deposit_event_data[127]
+    ]);
+    let index_offset = u32::from_be_bytes([
+        deposit_event_data[156], deposit_event_data[157], 
+        deposit_event_data[158], deposit_event_data[159]
+    ]);
+
+    // Validate exact offsets as per EIP-6110 specification
+    pubkey_offset == 160 && 
+    withdrawal_credentials_offset == 256 && 
+    amount_offset == 320 && 
+    signature_offset == 384 && 
+    index_offset == 512
+}
+
+/// Error type for invalid deposit event layout
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidDepositEventLayout;
+
+impl std::fmt::Display for InvalidDepositEventLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid deposit event data layout")
+    }
+}
+
+impl std::error::Error for InvalidDepositEventLayout {}

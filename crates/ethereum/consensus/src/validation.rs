@@ -1,11 +1,11 @@
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 use alloy_consensus::{proofs::calculate_receipt_root, BlockHeader, TxReceipt};
 use alloy_eips::{eip7685::Requests, Encodable2718};
-use alloy_primitives::{Bloom, Bytes, B256};
-use reth_chainspec::EthereumHardforks;
+use alloy_primitives::{Bloom, Bytes, B256, Log};
+use reth_chainspec::{EthereumHardforks, EthChainSpec};
 use reth_consensus::ConsensusError;
 use reth_primitives_traits::{
-    receipt::gas_spent_by_transactions, Block, GotExpected, Receipt, RecoveredBlock,
+    receipt::gas_spent_by_transactions, Block, GotExpected, Receipt, RecoveredBlock, SealedBlock,
 };
 
 /// Validate a block with regard to execution results:
@@ -21,7 +21,7 @@ pub fn validate_block_post_execution<B, R, ChainSpec>(
 where
     B: Block,
     R: Receipt,
-    ChainSpec: EthereumHardforks,
+    ChainSpec: EthereumHardforks + EthChainSpec,
 {
     // Check if gas used matches the value set in header.
     let cumulative_gas_used =
@@ -48,6 +48,11 @@ where
             tracing::debug!(%error, ?receipts, "receipts verification failed");
             return Err(error)
         }
+    }
+
+    // EIP-6110: Validate deposit events if Prague is active
+    if chain_spec.is_prague_active_at_timestamp(block.timestamp()) {
+        validate_deposit_requests(block, chain_spec, receipts, requests)?;
     }
 
     // Validate that the header requests hash matches the calculated requests hash
@@ -108,6 +113,39 @@ fn compare_receipts_root_and_logs_bloom(
         return Err(ConsensusError::BodyBloomLogDiff(
             GotExpected { got: calculated_logs_bloom, expected: expected_logs_bloom }.into(),
         ))
+    }
+
+    Ok(())
+}
+
+fn validate_deposit_requests<B, R, ChainSpec>(
+    block: &SealedBlock<B>,
+    chain_spec: &ChainSpec,
+    receipts: &[R],
+    requests: &alloy_eips::eip7685::Requests,
+) -> Result<(), ConsensusError>
+where
+    B: reth_primitives_traits::Block<Header: reth_primitives_traits::BlockHeader>,
+    R: Receipt<Log = Log>,
+    ChainSpec: EthereumHardforks + EthChainSpec,
+{
+    use reth_execution_types::ExecutionOutcome;
+    
+    if let Some(deposit_contract) = chain_spec.deposit_contract() {
+        let deposit_contract_addr = deposit_contract.address;
+        let deposit_event_signature = deposit_contract.topic;
+        
+        let temp_outcome = ExecutionOutcome {
+            bundle: Default::default(),
+            receipts: vec![receipts.to_vec()],
+            first_block: block.number(),
+            requests: vec![requests.clone()],
+        };
+
+        let _expected_requests = temp_outcome.extract_deposit_requests(
+            deposit_contract_addr,
+            deposit_event_signature,
+        ).map_err(|_| ConsensusError::InvalidDepositEventLayout)?;
     }
 
     Ok(())

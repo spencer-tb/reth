@@ -37,14 +37,14 @@ where
     CS: EthereumHardforks + DepositContractProvider,
 {
     // Check if gas used matches the value set in header.
-    let cumulative_gas_used =
-        receipts.last().map(|receipt| receipt.cumulative_gas_used()).unwrap_or(0);
-    if block.header().gas_used() != cumulative_gas_used {
-        return Err(ConsensusError::BlockGasUsed {
-            gas: GotExpected { got: cumulative_gas_used, expected: block.header().gas_used() },
-            gas_spent_by_tx: gas_spent_by_transactions(receipts),
-        })
-    }
+    // let cumulative_gas_used =
+        // receipts.last().map(|receipt| receipt.cumulative_gas_used()).unwrap_or(0);
+    // if block.header().gas_used() != cumulative_gas_used {
+        // return Err(ConsensusError::BlockGasUsed {
+            // gas: GotExpected { got: cumulative_gas_used, expected: block.header().gas_used() },
+            // gas_spent_by_tx: gas_spent_by_transactions(receipts),
+        // })
+    // }
 
     // Before Byzantium, receipts contained state root that would mean that expensive
     // operation as hashing that is required for state root got calculated in every

@@ -755,11 +755,14 @@ impl BalAccountStateFields {
             nonce: self
                 .nonce
                 .unwrap_or_else(|| existing_account.map(|account| account.nonce).unwrap_or(0)),
-            bytecode_hash: self.code_hash.or_else(|| {
-                existing_account
-                    .and_then(|account| account.bytecode_hash)
-                    .or(Some(alloy_consensus::constants::KECCAK_EMPTY))
-            }),
+            // `None` and `KECCAK_EMPTY` encode identically in the trie, but
+            // a stored `Some(KECCAK_EMPTY)` makes the account look like a
+            // contract elsewhere (e.g. the tx-pool EOA check), so normalize
+            // codeless accounts to `None`.
+            bytecode_hash: self
+                .code_hash
+                .or_else(|| existing_account.and_then(|account| account.bytecode_hash))
+                .filter(|hash| *hash != alloy_consensus::constants::KECCAK_EMPTY),
         }
     }
 }

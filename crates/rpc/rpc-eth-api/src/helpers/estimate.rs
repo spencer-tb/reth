@@ -8,6 +8,7 @@ use alloy_rpc_types_eth::{state::EvmOverrides, BlockId};
 use evm2::{
     evm::{CacheDB, Db, DynDatabase},
     interpreter::{InstrStop, Interpreter, Message, MessageResult},
+    version::GasId,
     EvmFeatures, Inspector, InspectorConfig, TxResult,
 };
 use futures::Future;
@@ -101,8 +102,10 @@ pub trait EstimateCall: Call {
         // the gas limit of the corresponding block
         let block_gas_limit = evm_env.block_env().gas_limit.to::<u64>();
         // As in geth, the search starts from the request's gas limit when it can pay for a
-        // transaction, even above the block gas limit, and from the block gas limit otherwise.
-        let request_gas_limit = tx_request_gas_limit.filter(|gas| *gas >= MIN_TRANSACTION_GAS);
+        // transaction, even above the block gas limit, and from the block gas limit otherwise. A
+        // transaction costs at least the fork's base cost, which EIP-2780 lowers.
+        let min_transaction_gas = evm_env.version().gas_params.get(GasId::TxBaseStipend);
+        let request_gas_limit = tx_request_gas_limit.filter(|gas| *gas >= min_transaction_gas);
         // If EIP-8037 is enabled, the transaction gas limit cap is not applicable
         let mut max_gas_limit = evm_env
             .version()
@@ -164,9 +167,12 @@ pub trait EstimateCall: Call {
             result.map(|result| (result, failed_calls))
         };
 
-        // For basic transfers, try using minimum gas before running full binary search
+        // For basic transfers, try using minimum gas before running full binary search, without
+        // going above the request's gas limit.
+        let transfer_gas_limit =
+            MIN_TRANSACTION_GAS.min(max_gas_limit).min(request_gas_limit.unwrap_or(u64::MAX));
         if is_basic_transfer &&
-            let Ok((res, _)) = execute(MIN_TRANSACTION_GAS.min(max_gas_limit)) &&
+            let Ok((res, _)) = execute(transfer_gas_limit) &&
             res.status
         {
             return Ok(U256::from(res.tx_gas_used()))

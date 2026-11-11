@@ -1921,6 +1921,62 @@ mod tests {
         assert!(gas <= U256::from(BLOCK_GAS_LIMIT), "{gas}");
     }
 
+    /// A request's gas limit bounds the estimate once it covers the fork's minimum transaction
+    /// cost: 21,000 before Amsterdam and 12,000 from Amsterdam (EIP-2780). A lower one is ignored.
+    #[tokio::test]
+    async fn estimate_gas_request_gas_from_minimum_transaction_cost() {
+        let sender = Address::repeat_byte(0x11);
+        let request = |gas: u64| {
+            TransactionRequest::default()
+                .with_from(sender)
+                .with_to(Address::repeat_byte(0xaa))
+                .with_gas_limit(gas)
+        };
+        let at = BlockId::latest();
+
+        // A zero-value transfer costs 21,000 before Amsterdam and 15,000 from Amsterdam.
+        for (chain_spec, gas, expected) in [
+            (ChainSpecBuilder::mainnet().cancun_activated().build(), 14_000, Some(21_000)),
+            (ChainSpecBuilder::mainnet().amsterdam_activated().build(), 14_000, None),
+            (ChainSpecBuilder::mainnet().amsterdam_activated().build(), 11_000, Some(15_000)),
+            (ChainSpecBuilder::mainnet().amsterdam_activated().build(), 16_000, Some(15_000)),
+        ] {
+            let provider = MockEthProvider::default().with_chain_spec(chain_spec);
+            provider.add_account(sender, ExtendedAccount::new(0, U256::from(1_000_000)));
+            provider.add_block(
+                B256::repeat_byte(0x42),
+                Block {
+                    header: Header {
+                        number: 1,
+                        gas_limit: 30_000_000,
+                        excess_blob_gas: Some(0),
+                        ..Default::default()
+                    },
+                    body: BlockBody::default(),
+                },
+            );
+            let api = build_test_eth_api(provider);
+            let result =
+                EthCall::estimate_gas_at(&api, request(gas), at, EvmOverrides::default()).await;
+            match expected {
+                Some(expected) => assert_eq!(result.unwrap(), U256::from(expected), "gas {gas}"),
+                // The 14,000 request bounds the transfer, which needs more.
+                None => {
+                    let err = result.expect_err("a request below the transfer's cost must fail");
+                    assert!(
+                        matches!(
+                            err.as_invalid_transaction(),
+                            Some(RpcInvalidTransactionError::GasRequiredExceedsAllowance {
+                                gas_limit: 14_000
+                            })
+                        ),
+                        "{err}"
+                    );
+                }
+            }
+        }
+    }
+
     /// `eth_call`, `eth_estimateGas` and `eth_simulateV1` never cap a call that sets its gas below
     /// the block gas limit, so a transaction that fits in the block can be executed even when the
     /// RPC gas cap is lower. Calls that omit gas keep the cap as their default, and a block

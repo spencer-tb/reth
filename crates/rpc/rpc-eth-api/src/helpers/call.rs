@@ -481,6 +481,7 @@ pub trait EthCall: EstimateCall + LoadBlock + FullEthApiTypes {
             let initial = request.as_ref().access_list().cloned().unwrap_or_default();
             let requested_gas = request.as_ref().gas_limit();
             let tx_gas_limit_cap = evm_env.version().tx_gas_limit_cap;
+            let tx_total_gas_cap = evm_env.version().tx_total_gas_cap;
             let (mut evm_env, mut tx_env) = this.prepare_call_env(
                 evm_env,
                 request,
@@ -488,9 +489,10 @@ pub trait EthCall: EstimateCall + LoadBlock + FullEthApiTypes {
                 EvmOverrides::state(state_override),
             )?;
             // The access list is for a transaction, so unlike a call it keeps Amsterdam's EIP-8037
-            // execution gas cap, and the RPC gas cap without the block gas limit floor.
+            // execution and total gas caps, and the RPC gas cap without the block gas limit floor.
             if evm_env.version().feature(evm2::EvmFeatures::EIP8037) {
                 evm_env.version_mut().tx_gas_limit_cap = tx_gas_limit_cap;
+                evm_env.version_mut().tx_total_gas_cap = tx_total_gas_cap;
             }
             let gas_cap = this.call_gas_limit();
             if requested_gas.is_some() && gas_cap != 0 && tx_env.gas_limit() > gas_cap {
@@ -948,6 +950,10 @@ pub trait Call:
         // EIP-8037 it caps execution gas and intrinsic gas instead, so lifting it makes all of the
         // call's gas execution gas and leaves no state gas reservoir.
         evm_env.version_mut().tx_gas_limit_cap = u64::MAX;
+        // A call that omits gas still defaults to at most the gas limit a transaction may have.
+        let max_default_gas_limit = evm_env.version().tx_gas_caps().0;
+        // With the execution gas cap lifted, the EIP-8037 total gas cap does not apply either.
+        evm_env.version_mut().tx_total_gas_cap = u64::MAX;
 
         // Disable additional fee charges, e.g. opstack operator fee charge
         // See:
@@ -991,9 +997,7 @@ pub trait Call:
             }
         } else {
             // cap request's gas limit to call gas limit
-            tx_env
-                .inner_mut()
-                .set_gas_limit(self.call_gas_limit().min(evm_env.version().tx_gas_caps().0));
+            tx_env.inner_mut().set_gas_limit(self.call_gas_limit().min(max_default_gas_limit));
         }
 
         // lower the basefee to 0 to avoid breaking EVM invariants (basefee < gasprice): <https://github.com/ethereum/go-ethereum/blob/355228b011ef9a85ebc0f21e7196f892038d49f0/internal/ethapi/api.go#L700-L704>

@@ -2112,6 +2112,57 @@ mod tests {
         }
     }
 
+    /// With Amsterdam's EIP-8037 execution gas cap lifted, `eth_call` does not apply the total gas
+    /// cap of a transaction either, while `eth_createAccessList` keeps it.
+    #[tokio::test]
+    async fn call_gas_above_total_gas_cap_amsterdam() {
+        const GAS: u64 = 5_000_000_000;
+        let total_gas_cap = u64::from(u32::MAX);
+        let provider = MockEthProvider::default()
+            .with_chain_spec(ChainSpecBuilder::mainnet().amsterdam_activated().build());
+        provider.add_block(
+            B256::repeat_byte(0x42),
+            Block {
+                header: Header {
+                    number: 1,
+                    gas_limit: GAS,
+                    excess_blob_gas: Some(0),
+                    ..Default::default()
+                },
+                body: BlockBody::default(),
+            },
+        );
+        let api = build_test_eth_api_with_gas_cap(provider, GAS);
+        let gas_at_entry = Address::repeat_byte(0xab);
+        let state_override = StateOverride::from_iter([(
+            gas_at_entry,
+            // Returns the gas left at entry: GAS PUSH0 MSTORE PUSH1 0x20 PUSH0 RETURN
+            AccountOverride {
+                code: Some(alloy_primitives::bytes!("5a5f5260205ff3")),
+                ..Default::default()
+            },
+        )]);
+        let request = TransactionRequest::default()
+            .with_from(Address::repeat_byte(0x11))
+            .with_to(gas_at_entry)
+            .with_gas_limit(GAS);
+
+        let output = EthCall::call(
+            &api,
+            request.clone(),
+            None,
+            EvmOverrides::state(Some(state_override.clone())),
+        )
+        .await
+        .unwrap();
+        assert!(U256::from_be_slice(&output) > U256::from(total_gas_cap), "{output}");
+
+        // An access list is for a transaction, so it keeps the total gas cap.
+        assert!(EthCall::create_access_list_at(&api, request, None, Some(state_override))
+            .await
+            .is_err());
+    }
+
     #[tokio::test]
     async fn header_responses_omit_size_while_blocks_keep_it() {
         let provider = MockEthProvider::default();

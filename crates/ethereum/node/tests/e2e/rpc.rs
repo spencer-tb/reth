@@ -1062,11 +1062,12 @@ async fn test_advance_while_send_raw_transaction_sync() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Before Amsterdam `eth_call` ignores the EIP-7825 transaction gas cap. With Amsterdam's EIP-8037
-/// it caps execution gas, so a call that runs out of execution gas fails like the transaction
+/// `eth_call` ignores the EIP-7825 transaction gas cap, which with Amsterdam's EIP-8037 caps
+/// execution gas instead, so all of a call's gas is execution gas. `eth_createAccessList` is for a
+/// transaction, so with Amsterdam a call that runs out of execution gas fails like the transaction
 /// would.
 #[tokio::test]
-async fn eth_call_caps_execution_gas_under_amsterdam() -> eyre::Result<()> {
+async fn eth_call_lifts_execution_gas_cap_under_amsterdam() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     // Loops `CALLDATALOAD(0)` times, about 26 gas each, then returns 1.
@@ -1092,19 +1093,17 @@ async fn eth_call_caps_execution_gas_under_amsterdam() -> eyre::Result<()> {
         assert_eq!(U256::from_be_slice(&ok), U256::ONE, "{fork}");
 
         // About 26M gas of execution, above the 16,777,216 cap.
-        let call_result = provider
-            .raw_request::<_, Bytes>("eth_call".into(), (call(1_000_000), "latest", &overrides))
-            .await;
+        let output: Bytes = provider
+            .raw_request("eth_call".into(), (call(1_000_000), "latest", &overrides))
+            .await?;
+        assert_eq!(U256::from_be_slice(&output), U256::ONE, "{fork}");
         let access_list: AccessListResult = provider
             .raw_request("eth_createAccessList".into(), (call(1_000_000), "latest", &overrides))
             .await?;
         if fork == EthereumHardfork::Amsterdam {
-            let err = call_result.unwrap_err().to_string();
-            assert!(err.contains("out of gas"), "{err}");
             assert_eq!(access_list.gas_used, U256::from(16_777_216));
             assert!(access_list.error.is_some());
         } else {
-            assert_eq!(U256::from_be_slice(&call_result?), U256::ONE);
             assert!(access_list.gas_used > U256::from(26_000_000));
             assert!(access_list.error.is_none());
         }

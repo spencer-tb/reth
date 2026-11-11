@@ -156,6 +156,8 @@ pub trait EthCall: EstimateCall + LoadBlock + FullEthApiTypes {
                     if !validation || !evm_env.version().feature(evm2::EvmFeatures::EIP8037) {
                         evm_env.version_mut().tx_gas_limit_cap = u64::MAX;
                     }
+                    // EIP-8037's total transaction gas cap applies in neither mode.
+                    evm_env.version_mut().tx_total_gas_cap = u64::MAX;
 
                     if !validation {
                         // If not explicitly required, we disable nonce check <https://github.com/paradigmxyz/reth/issues/16108>
@@ -477,12 +479,18 @@ pub trait EthCall: EstimateCall + LoadBlock + FullEthApiTypes {
     {
         self.spawn_with_state_at_block(at, |this, mut db| {
             let initial = request.as_ref().access_list().cloned().unwrap_or_default();
-            let (evm_env, mut tx_env) = this.prepare_call_env(
+            let tx_gas_limit_cap = evm_env.version().tx_gas_limit_cap;
+            let (mut evm_env, mut tx_env) = this.prepare_call_env(
                 evm_env,
                 request,
                 &mut db,
                 EvmOverrides::state(state_override),
             )?;
+            // The access list is for a transaction, so unlike a call it keeps Amsterdam's EIP-8037
+            // execution gas cap.
+            if evm_env.version().feature(evm2::EvmFeatures::EIP8037) {
+                evm_env.version_mut().tx_gas_limit_cap = tx_gas_limit_cap;
+            }
             let chain_id = evm_env.chain_id();
 
             let mut evm = this.evm_config().evm_with_env(&mut db, evm_env);
@@ -932,11 +940,9 @@ pub trait Call:
         evm_env.version_mut().features.remove(evm2::EvmFeatures::BASE_FEE_CHECK);
 
         // Disable EIP-7825 transaction gas limit to support larger transactions. Under Amsterdam's
-        // EIP-8037 it only caps execution gas, the rest going to the state gas reservoir, so keep
-        // it to execute the call like a transaction.
-        if !evm_env.version().feature(evm2::EvmFeatures::EIP8037) {
-            evm_env.version_mut().tx_gas_limit_cap = u64::MAX;
-        }
+        // EIP-8037 it caps execution gas and intrinsic gas instead, so lifting it makes all of the
+        // call's gas execution gas and leaves no state gas reservoir.
+        evm_env.version_mut().tx_gas_limit_cap = u64::MAX;
 
         // Disable additional fee charges, e.g. opstack operator fee charge
         // See:

@@ -536,7 +536,10 @@ mod tests {
     use super::*;
     use alloy_consensus::{Block, BlockBody, Header};
     use alloy_eips::{
-        eip4844::DATA_GAS_PER_BLOB, eip7702::Authorization, eip7825::MAX_TX_GAS_LIMIT_OSAKA,
+        eip2930::{AccessList, AccessListItem},
+        eip4844::DATA_GAS_PER_BLOB,
+        eip7702::Authorization,
+        eip7825::MAX_TX_GAS_LIMIT_OSAKA,
         BlockId, BlockNumberOrTag,
     };
     use alloy_genesis::{Genesis, GenesisAccount};
@@ -1882,6 +1885,86 @@ mod tests {
         .await
         .unwrap();
         assert!(gas_left(&output) <= U256::from(BLOCK_GAS_LIMIT), "{output}");
+    }
+
+    /// Under Amsterdam's EIP-8037, `eth_call` and `eth_simulateV1` without validation make all of
+    /// a call's gas execution gas, and allow intrinsic gas above the execution gas cap, while
+    /// `eth_simulateV1` with validation executes the call as a transaction.
+    #[tokio::test]
+    async fn call_and_simulate_execution_gas_cap_amsterdam() {
+        const BLOCK_GAS_LIMIT: u64 = 30_000_000;
+        let sender = Address::repeat_byte(0x11);
+        let gas_at_entry = Address::repeat_byte(0xab);
+        let genesis = Genesis::default()
+            .with_gas_limit(BLOCK_GAS_LIMIT)
+            .with_base_fee(Some(0))
+            .extend_accounts([
+                (sender, GenesisAccount::default().with_balance(U256::from(10u128.pow(18)))),
+                (
+                    gas_at_entry,
+                    // Returns the gas left at entry: GAS PUSH0 MSTORE PUSH1 0x20 PUSH0 RETURN
+                    GenesisAccount::default()
+                        .with_code(Some(alloy_primitives::bytes!("5a5f5260205ff3"))),
+                ),
+            ]);
+        let chain_spec =
+            Arc::new(ChainSpecBuilder::mainnet().amsterdam_activated().genesis(genesis).build());
+        let factory = create_test_provider_factory_with_chain_spec(chain_spec);
+        init_genesis(&factory).unwrap();
+        let provider = BlockchainProvider::new(factory).unwrap();
+        let api = EthApiBuilder::new(
+            provider.clone(),
+            testing_pool(),
+            NoopNetwork::default(),
+            EthEvmConfig::new(provider.chain_spec()),
+        )
+        .build();
+        let gas_left = |output: &Bytes| U256::from_be_slice(output);
+        let execution_gas_cap = U256::from(MAX_TX_GAS_LIMIT_OSAKA);
+        let request = TransactionRequest::default()
+            .with_from(sender)
+            .with_to(gas_at_entry)
+            .with_gas_limit(20_000_000);
+
+        let output =
+            EthCall::call(&api, request.clone(), None, EvmOverrides::default()).await.unwrap();
+        assert!(gas_left(&output) > execution_gas_cap, "{output}");
+
+        // At about 4,000 gas per storage key, the access list costs about 20M intrinsic gas.
+        let storage_keys = (0..5_000u64).map(|key| B256::from(U256::from(key))).collect();
+        let large_intrinsic =
+            request.clone().with_gas_limit(BLOCK_GAS_LIMIT).with_access_list(AccessList(vec![
+                AccessListItem { address: gas_at_entry, storage_keys },
+            ]));
+        let output =
+            EthCall::call(&api, large_intrinsic, None, EvmOverrides::default()).await.unwrap();
+        assert!(
+            gas_left(&output) < U256::from(BLOCK_GAS_LIMIT - MAX_TX_GAS_LIMIT_OSAKA),
+            "{output}"
+        );
+
+        for validation in [false, true] {
+            let blocks = EthCall::simulate_v1(
+                &api,
+                SimulatePayload {
+                    validation,
+                    block_state_calls: vec![
+                        SimBlock::default().call(request.clone().with_nonce(0).with_gas_price(0))
+                    ],
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            let call = &blocks[0].calls[0];
+            assert!(call.status, "{call:?}");
+            assert_eq!(
+                gas_left(&call.return_data) > execution_gas_cap,
+                !validation,
+                "validation: {validation}"
+            );
+        }
     }
 
     #[tokio::test]

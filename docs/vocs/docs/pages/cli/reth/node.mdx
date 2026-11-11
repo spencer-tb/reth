@@ -497,6 +497,8 @@ RPC:
 
           The calls of an `eth_callMany`, `trace_callMany` or `debug_traceCallMany` request share it.
 
+          A call that sets its gas limit is never capped below the block gas limit, except in `eth_createAccessList` and by the shared budget above.
+
           [default: 50000000]
 
       --rpc.evm-memory-limit <MEMORY_LIMIT>

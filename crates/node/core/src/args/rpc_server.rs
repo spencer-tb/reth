@@ -662,6 +662,9 @@ pub struct RpcServerArgs {
     /// Maximum gas limit for `eth_call`, `eth_estimateGas`, and call tracing RPC methods.
     ///
     /// The calls of an `eth_callMany`, `trace_callMany` or `debug_traceCallMany` request share it.
+    ///
+    /// A call that sets its gas limit is never capped below the block gas limit, except in
+    /// `eth_createAccessList` and by the shared budget above.
     #[arg(
         long = "rpc.gascap",
         alias = "rpc-gascap",

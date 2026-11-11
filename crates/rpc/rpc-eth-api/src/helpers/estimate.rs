@@ -409,7 +409,7 @@ impl FailedCallCounter {
         core::mem::take(&mut self.failed)
     }
 
-    fn frame_end<T: evm2::EvmTypes>(
+    const fn frame_end<T: evm2::EvmTypes>(
         &mut self,
         interp: &mut Interpreter<'_, '_, T>,
         message: &Message<T>,

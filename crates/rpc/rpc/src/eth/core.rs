@@ -1617,18 +1617,24 @@ mod tests {
     #[tokio::test]
     async fn estimate_gas_transfer_respects_rpc_gas_cap() {
         let provider = MockEthProvider::default();
+        // The RPC gas cap is floored at the block gas limit, so the block's own limit is below the
+        // caps. A larger limit set through block overrides must not lift the cap.
         provider.add_block(
             B256::repeat_byte(0x42),
             Block {
-                header: Header { number: 1, gas_limit: 30_000_000, ..Default::default() },
+                header: Header { number: 1, gas_limit: 20_000, ..Default::default() },
                 body: BlockBody::default(),
             },
         );
         let request = TransactionRequest::default().with_to(Address::repeat_byte(0xaa));
         let at = BlockId::latest();
+        let overrides = EvmOverrides::default().with_block(Box::new(BlockOverrides {
+            gas_limit: Some(30_000_000),
+            ..Default::default()
+        }));
 
         let capped = build_test_eth_api_with_gas_cap(provider.clone(), 20_999);
-        let err = EthCall::estimate_gas_at(&capped, request.clone(), at, EvmOverrides::default())
+        let err = EthCall::estimate_gas_at(&capped, request.clone(), at, overrides.clone())
             .await
             .expect_err("the transfer shortcut must respect the RPC gas cap");
         assert!(
@@ -1640,9 +1646,8 @@ mod tests {
         );
 
         let sufficient = build_test_eth_api_with_gas_cap(provider, 21_000);
-        let estimated = EthCall::estimate_gas_at(&sufficient, request, at, EvmOverrides::default())
-            .await
-            .unwrap();
+        let estimated =
+            EthCall::estimate_gas_at(&sufficient, request, at, overrides).await.unwrap();
         assert_eq!(estimated, U256::from(21_000));
     }
 

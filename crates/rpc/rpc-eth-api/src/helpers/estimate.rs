@@ -7,8 +7,8 @@ use alloy_primitives::{TxKind, U256};
 use alloy_rpc_types_eth::{state::EvmOverrides, BlockId};
 use evm2::{
     evm::{CacheDB, Db, DynDatabase},
-    interpreter::InstrStop,
-    EvmFeatures, TxResult,
+    interpreter::{InstrStop, Interpreter, Message, MessageResult},
+    EvmFeatures, Inspector, InspectorConfig, TxResult,
 };
 use futures::Future;
 use reth_chainspec::MIN_TRANSACTION_GAS;
@@ -137,22 +137,33 @@ pub trait EstimateCall: Call {
 
         trace!(target: "rpc::eth::estimate", ?tx_env, gas_limit = highest_gas_limit, is_basic_transfer, "Starting gas estimation");
 
+        // Under EIP-8037 the execution gas of a transaction is capped and the rest of its gas
+        // funds the state gas reservoir. Without EIP-8037 this is `u64::MAX`.
+        let execution_gas_cap = evm_env.version().tx_gas_caps().1;
+
         let mut evm = self.evm_config().evm_with_env(&mut db, evm_env);
+        // Each execution also returns how many of its nested calls failed.
+        evm.set_inspector(FailedCallCounter::default());
         let mut execute = move |gas_limit| {
             tx_env.inner_mut().set_gas_limit(gas_limit);
-            evm.transact_result(&tx_env).map_err(Self::Error::from_evm_err)
+            let result = evm.transact_result(&tx_env).map_err(Self::Error::from_evm_err);
+            // SAFETY: `FailedCallCounter` has no lifetime parameters.
+            let failed_calls =
+                unsafe { evm.with_inspector(|counter: &mut FailedCallCounter| counter.take()) }
+                    .unwrap_or_default();
+            result.map(|result| (result, failed_calls))
         };
 
         // For basic transfers, try using minimum gas before running full binary search
         if is_basic_transfer &&
-            let Ok(res) = execute(MIN_TRANSACTION_GAS.min(max_gas_limit)) &&
+            let Ok((res, _)) = execute(MIN_TRANSACTION_GAS.min(max_gas_limit)) &&
             res.status
         {
             return Ok(U256::from(res.tx_gas_used()))
         }
 
         // Execute the transaction with the highest possible gas limit.
-        let mut res = match execute(highest_gas_limit) {
+        let (res, failed_calls) = match execute(highest_gas_limit) {
             // Handle the exceptional case where the transaction initialization uses too much
             // gas. If the gas price or gas limit was specified in the request,
             // retry the transaction with the block's gas limit to determine if
@@ -161,7 +172,7 @@ pub trait EstimateCall: Call {
                 if err.is_gas_too_high() &&
                     (tx_request_gas_limit.is_some() || tx_request_gas_price.is_some()) =>
             {
-                let retry = execute(max_gas_limit)?;
+                let (retry, _) = execute(max_gas_limit)?;
                 return map_out_of_gas_result::<_, EvmTypesFor<Self::Evm>>(retry, highest_gas_limit)
             }
             Err(err) if err.is_gas_too_low() => {
@@ -184,7 +195,7 @@ pub trait EstimateCall: Call {
             // if price or limit was included in the request then we can execute the request
             // again with the block's gas limit to check if revert is gas related or not
             return if tx_request_gas_limit.is_some() || tx_request_gas_price.is_some() {
-                let retry = execute(max_gas_limit)?;
+                let (retry, _) = execute(max_gas_limit)?;
                 map_out_of_gas_result::<_, EvmTypesFor<Self::Evm>>(retry, highest_gas_limit)
             } else {
                 // the transaction did revert
@@ -195,6 +206,22 @@ pub trait EstimateCall: Call {
             // limit
             return Err(Self::Error::from_evm_halt(res.stop, highest_gas_limit))
         };
+
+        // A gas limit only counts as sufficient if no more nested calls fail than in a reference
+        // execution. Otherwise the search can settle on a limit at which a nested call runs out of
+        // gas, the caller catches the failure and the transaction succeeds while doing something
+        // other than intended.
+        //
+        // Under EIP-8037, gas above the execution gas cap only funds the state gas reservoir. A
+        // transaction that completes a nested call only with a reservoir would otherwise be sized
+        // past the cap, so the execution at the cap is also a reference when it succeeds.
+        let mut allowed_failed_calls = failed_calls;
+        if execution_gas_cap < highest_gas_limit &&
+            let Ok((capped, capped_failed_calls)) = execute(execution_gas_cap) &&
+            capped.status
+        {
+            allowed_failed_calls = allowed_failed_calls.max(capped_failed_calls);
+        }
 
         // At this point we know the call succeeded but want to find the _best_ (lowest) gas the
         // transaction succeeds with. We find this by doing a binary search over the possible range.
@@ -215,13 +242,15 @@ pub trait EstimateCall: Call {
         if optimistic_gas_limit < highest_gas_limit {
             // Re-execute the transaction with the new gas limit and update the result and
             // environment.
-            res = execute(optimistic_gas_limit)?;
+            let (res, failed_calls) = execute(optimistic_gas_limit)?;
 
             // Update the gas used based on the new result.
             gas_used = res.tx_gas_used();
             // Update the gas limit estimates (highest and lowest) based on the execution result.
             update_estimated_gas_range::<EvmTypesFor<Self::Evm>>(
                 res,
+                failed_calls,
+                allowed_failed_calls,
                 optimistic_gas_limit,
                 &mut highest_gas_limit,
                 &mut lowest_gas_limit,
@@ -262,9 +291,12 @@ pub trait EstimateCall: Call {
                 }
                 // Handle other cases, including successful transactions.
                 ethres => {
+                    let (res, failed_calls) = ethres?;
                     // Update the estimated gas range based on the execution result.
                     update_estimated_gas_range::<EvmTypesFor<Self::Evm>>(
-                        ethres?,
+                        res,
+                        failed_calls,
+                        allowed_failed_calls,
                         mid_gas_limit,
                         &mut highest_gas_limit,
                         &mut lowest_gas_limit,
@@ -330,15 +362,18 @@ where
 ///
 /// This function refines the gas limit estimates used in a binary search to find the optimal
 /// gas limit for a transaction. It adjusts the highest or lowest gas limits depending on
-/// whether the execution succeeded, reverted, or halted due to specific reasons.
+/// whether the execution succeeded, reverted, or halted due to specific reasons. An execution in
+/// which more than `allowed_failed_calls` nested calls failed counts as failed as well.
 #[inline]
 pub fn update_estimated_gas_range<EvmTypes: evm2::EvmTypes>(
     result: TxResult<EvmTypes>,
+    failed_calls: usize,
+    allowed_failed_calls: usize,
     tx_gas_limit: u64,
     highest_gas_limit: &mut u64,
     lowest_gas_limit: &mut u64,
 ) -> Result<(), EthApiError> {
-    if result.status {
+    if result.status && failed_calls <= allowed_failed_calls {
         // Cap the highest gas limit with the succeeding gas limit.
         *highest_gas_limit = tx_gas_limit;
     } else {
@@ -350,8 +385,62 @@ pub fn update_estimated_gas_range<EvmTypes: evm2::EvmTypes>(
         //
         // Common usage of invalid opcode in OpenZeppelin:
         // <https://github.com/OpenZeppelin/openzeppelin-contracts/blob/94697be8a3f0dfcd95dfb13ffbd39b5973f5c65d/contracts/metatx/ERC2771Forwarder.sol#L360-L367>
+        //
+        // The same holds for a transaction that only succeeds because a nested call failed, for
+        // example ran out of gas, and its caller caught the failure.
         *lowest_gas_limit = tx_gas_limit;
     }
 
     Ok(())
+}
+
+/// Counts the nested calls and contract creations of a transaction that fail: revert, halt or
+/// fail before their frame runs.
+///
+/// It only observes call and create messages, so frames run without step hooks.
+#[derive(Debug, Default)]
+struct FailedCallCounter {
+    failed: usize,
+}
+
+impl FailedCallCounter {
+    /// Returns how many nested calls failed since the count was last taken, and resets it.
+    fn take(&mut self) -> usize {
+        core::mem::take(&mut self.failed)
+    }
+
+    fn frame_end<T: evm2::EvmTypes>(
+        &mut self,
+        interp: &mut Interpreter<'_, '_, T>,
+        message: &Message<T>,
+        result: &MessageResult<T>,
+    ) {
+        if !result.is_success() && message.depth > interp.host().initial_call_depth() {
+            self.failed += 1;
+        }
+    }
+}
+
+impl<T: evm2::EvmTypes> Inspector<T> for FailedCallCounter {
+    fn inspector_config(&self) -> InspectorConfig {
+        InspectorConfig::without_steps()
+    }
+
+    fn call_end(
+        &mut self,
+        interp: &mut Interpreter<'_, '_, T>,
+        message: &Message<T>,
+        result: &mut MessageResult<T>,
+    ) {
+        self.frame_end(interp, message, result);
+    }
+
+    fn create_end(
+        &mut self,
+        interp: &mut Interpreter<'_, '_, T>,
+        message: &Message<T>,
+        result: &mut MessageResult<T>,
+    ) {
+        self.frame_end(interp, message, result);
+    }
 }

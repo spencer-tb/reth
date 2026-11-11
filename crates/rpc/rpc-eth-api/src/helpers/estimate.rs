@@ -20,6 +20,7 @@ use reth_rpc_convert::{RpcConvert, RpcTxReq};
 use reth_rpc_eth_types::{
     cache::db::{apply_block_overrides, apply_state_overrides},
     error::api::{FromEvmHalt, FromRevert},
+    utils::effective_gas_cap,
     EthApiError, RpcInvalidTransactionError,
 };
 use reth_rpc_server_types::constants::gas_oracle::{CALL_STIPEND_GAS, ESTIMATE_GAS_ERROR_RATIO};
@@ -76,6 +77,10 @@ pub trait EstimateCall: Call {
         // Configure the evm env
         let mut db = CacheDB::new(Db::new(StateProviderDatabase::new(state)));
 
+        // The gas limit of the block itself, which a block override must not lift the RPC gas cap
+        // to.
+        let header_gas_limit = evm_env.block_env().gas_limit.to::<u64>();
+
         // Apply any block overrides before deriving block-derived limits and the tx env so
         // overrides for `gasLimit`, `baseFee` and `blobBaseFee` are visible to estimation.
         // Mirrors geth's behavior, see:
@@ -94,8 +99,9 @@ pub trait EstimateCall: Call {
         // If EIP-8037 is enabled, the transaction gas limit cap is not applicable
         let mut max_gas_limit = evm_env.version().tx_gas_caps().0.min(block_gas_limit);
 
-        // Also bound diagnostic retries by the RPC gas cap. Zero means unlimited.
-        let gas_cap = self.call_gas_limit();
+        // Also bound diagnostic retries by the RPC gas cap, which never limits the search below
+        // the block gas limit. Zero means unlimited.
+        let gas_cap = effective_gas_cap(self.call_gas_limit(), header_gas_limit);
         if gas_cap != 0 {
             max_gas_limit = max_gas_limit.min(gas_cap);
         }

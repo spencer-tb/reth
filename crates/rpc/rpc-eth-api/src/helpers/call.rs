@@ -35,8 +35,8 @@ use reth_rpc_eth_types::{
         attach_bal_before_tx,
     },
     error::{AsEthApiError, FromEthApiError},
-    simulate::{self, EthSimulateError, SimulatedState},
-    utils::CallManyBudget,
+    simulate::{self, EthSimulateError, SimulateGasBudget, SimulatedState},
+    utils::{effective_gas_cap, CallManyBudget},
     EthApiError, RpcInvalidTransactionError, StateCacheDb,
 };
 use reth_storage_api::{BlockIdReader, ProviderTx, StateProvider};
@@ -128,8 +128,10 @@ pub trait EthCall: EstimateCall + LoadBlock + FullEthApiTypes {
                 let mut blocks: Vec<SimulatedBlock<RpcBlock<Self::NetworkTypes>>> =
                     Vec::with_capacity(block_state_calls.len());
 
-                let call_gas_limit = this.call_gas_limit();
-                let mut remaining_call_gas_limit = (call_gas_limit > 0).then_some(call_gas_limit);
+                // Calls that set `gas` may use a budget floored at the gas limit of the base
+                // block, calls that omit it keep the RPC gas cap.
+                let mut gas_budget =
+                    SimulateGasBudget::new(this.call_gas_limit(), parent.gas_limit());
 
                 for block in block_state_calls {
                     let SimBlock { block_overrides, state_overrides, calls } = block;
@@ -242,7 +244,7 @@ pub trait EthCall: EstimateCall + LoadBlock + FullEthApiTypes {
                         builder,
                         &*state_provider,
                         calls,
-                        &mut remaining_call_gas_limit,
+                        &mut gas_budget,
                         chain_id,
                         simulation_state.as_mut(),
                         this.converter(),
@@ -912,6 +914,9 @@ pub trait Call:
     {
         // track whether the request has a gas limit set
         let requested_gas = request.as_ref().gas_limit();
+        // The gas limit of the block itself, which a block override must not lift the RPC gas cap
+        // to.
+        let header_gas_limit = evm_env.block_env().gas_limit.to::<u64>();
 
         // Disable block gas limit check to allow executing transactions with higher gas limit (call
         // gas limit): https://github.com/paradigmxyz/reth/issues/18577
@@ -965,7 +970,8 @@ pub trait Call:
         let mut tx_env = self.create_txn_env(&evm_env, request, &mut *db)?;
 
         if let Some(requested_gas) = requested_gas {
-            let global_gas_cap = self.call_gas_limit();
+            // The RPC gas cap never limits an explicit gas limit below the block gas limit.
+            let global_gas_cap = effective_gas_cap(self.call_gas_limit(), header_gas_limit);
             if global_gas_cap != 0 && global_gas_cap < requested_gas {
                 // Callers routinely send gas limits above the cap, so this is not worth a warning.
                 // Log only the limits: the request carries caller calldata and addresses.

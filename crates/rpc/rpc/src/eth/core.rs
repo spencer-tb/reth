@@ -1271,7 +1271,9 @@ mod tests {
             (50_000, None, 0, 100_000, 100_000, 50_000),
             (50_000, None, 1, 40_000, 100_000, 40_000),
             (50_000, None, 1, 100_000, 40_000, 40_000),
-            (50_000, Some(70_000), 1, 100_000, 100_000, 50_000),
+            // The RPC gas cap does not limit an explicit gas below the block gas limit.
+            (50_000, Some(70_000), 1, 100_000, 100_000, 70_000),
+            (50_000, Some(170_000), 1, 100_000, 100_000, 100_000),
             (50_000, Some(30_000), 1, 100_000, 100_000, 30_000),
             (50_000, Some(70_000), 1, 100_000, 40_000, 50_000),
             (50_000, Some(30_000), 1, 0, 100_000, 30_000),
@@ -1398,8 +1400,9 @@ mod tests {
             (sender, AccountOverride { balance: Some(U256::from(101_000)), ..Default::default() }),
             (contract, AccountOverride { code: Some(code), ..Default::default() }),
         ]);
-        // Omitted gas, and gas above the RPC cap.
-        for (gas, expected_gas) in [(None, 50_000), (Some(70_000), 50_000), (Some(30_000), 30_000)]
+        // Omitted gas, and gas above the RPC cap and the block gas limit it is floored at.
+        for (gas, expected_gas) in
+            [(None, 50_000), (Some(170_000), 100_000), (Some(30_000), 30_000)]
         {
             let request = TransactionRequest {
                 gas,
@@ -1477,7 +1480,13 @@ mod tests {
         let contract = Address::repeat_byte(0xaa);
         let mut state_override = StateOverride::default();
         state_override.insert(contract, AccountOverride { code: Some(code), ..Default::default() });
-        let overrides = EvmOverrides::state(Some(state_override));
+        // The RPC gas cap is floored at the block gas limit, so the block's own limit is below the
+        // low cap. A larger limit set through block overrides must not lift the cap.
+        let overrides =
+            EvmOverrides::state(Some(state_override)).with_block(Box::new(BlockOverrides {
+                gas_limit: Some(30_000_000),
+                ..Default::default()
+            }));
         let at = BlockId::latest();
 
         for chain_spec in [
@@ -1492,7 +1501,7 @@ mod tests {
                 Block {
                     header: Header {
                         number: 1,
-                        gas_limit: 30_000_000,
+                        gas_limit: 40_000,
                         excess_blob_gas: Some(0),
                         ..Default::default()
                     },
@@ -1631,6 +1640,112 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(estimated, U256::from(21_000));
+    }
+
+    /// `eth_call`, `eth_estimateGas` and `eth_simulateV1` never cap a call that sets its gas below
+    /// the block gas limit, so a transaction that fits in the block can be executed even when the
+    /// RPC gas cap is lower. Calls that omit gas keep the cap as their default, and a block
+    /// override of the gas limit does not lift the cap.
+    #[tokio::test]
+    async fn rpc_gas_cap_never_limits_explicit_gas_below_block_gas_limit() {
+        // Gas the contract needs at entry, above the RPC gas cap.
+        const THRESHOLD: u64 = 12_000_000;
+        const GAS_CAP: u64 = 10_000_000;
+        const BLOCK_GAS_LIMIT: u64 = 30_000_000;
+        let sender = Address::repeat_byte(0x11);
+        let needs_gas = Address::repeat_byte(0xaa);
+        let gas_at_entry = Address::repeat_byte(0xab);
+        let genesis = Genesis::default()
+            .with_gas_limit(BLOCK_GAS_LIMIT)
+            .with_base_fee(Some(0))
+            .extend_accounts([
+                (sender, GenesisAccount::default().with_balance(U256::from(10u128.pow(18)))),
+                (
+                    needs_gas,
+                    // Returns the gas left at entry if it is at least THRESHOLD, reverts
+                    // otherwise: GAS PUSH4 THRESHOLD DUP2 LT PUSH1 0x11 JUMPI PUSH0 MSTORE
+                    // PUSH1 0x20 PUSH0 RETURN JUMPDEST PUSH0 PUSH0 REVERT
+                    GenesisAccount::default().with_code(Some(alloy_primitives::bytes!(
+                        "5a6300b71b0081106011575f5260205ff35b5f5ffd"
+                    ))),
+                ),
+                (
+                    gas_at_entry,
+                    // Returns the gas left at entry: GAS PUSH0 MSTORE PUSH1 0x20 PUSH0 RETURN
+                    GenesisAccount::default()
+                        .with_code(Some(alloy_primitives::bytes!("5a5f5260205ff3"))),
+                ),
+            ]);
+        let chain_spec =
+            Arc::new(ChainSpecBuilder::mainnet().amsterdam_activated().genesis(genesis).build());
+        let factory = create_test_provider_factory_with_chain_spec(chain_spec);
+        init_genesis(&factory).unwrap();
+        let provider = BlockchainProvider::new(factory).unwrap();
+        let api = EthApiBuilder::new(
+            provider.clone(),
+            testing_pool(),
+            NoopNetwork::default(),
+            EthEvmConfig::new(provider.chain_spec()),
+        )
+        .gas_cap(GAS_CAP.into())
+        .build();
+        let gas_left = |output: &Bytes| U256::from_be_slice(output);
+        let request = TransactionRequest::default().with_from(sender).with_to(needs_gas);
+        let with_gas = request.clone().with_gas_limit(20_000_000);
+        let without_gas = TransactionRequest::default().with_from(sender).with_to(gas_at_entry);
+
+        // An explicit gas above the cap is allowed up to the block gas limit.
+        let output =
+            EthCall::call(&api, with_gas.clone(), None, EvmOverrides::default()).await.unwrap();
+        assert!(gas_left(&output) >= U256::from(THRESHOLD), "{output}");
+
+        // Without an explicit gas, the default stays the cap.
+        let output =
+            EthCall::call(&api, without_gas.clone(), None, EvmOverrides::default()).await.unwrap();
+        assert!(gas_left(&output) <= U256::from(GAS_CAP), "{output}");
+
+        // The estimate's search reaches the block gas limit.
+        let estimated =
+            EthCall::estimate_gas_at(&api, request, BlockId::latest(), EvmOverrides::default())
+                .await
+                .unwrap();
+        assert!(estimated >= U256::from(THRESHOLD), "{estimated}");
+        assert!(estimated <= U256::from(BLOCK_GAS_LIMIT), "{estimated}");
+
+        // The same holds for the calls of a simulated block.
+        let blocks = EthCall::simulate_v1(
+            &api,
+            SimulatePayload {
+                block_state_calls: vec![SimBlock::default().call(with_gas).call(without_gas)],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let calls = &blocks[0].calls;
+        assert!(calls[0].status, "{:?}", calls[0]);
+        assert!(gas_left(&calls[0].return_data) >= U256::from(THRESHOLD));
+        assert!(calls[1].status, "{:?}", calls[1]);
+        assert!(gas_left(&calls[1].return_data) <= U256::from(GAS_CAP));
+
+        // A larger block gas limit set through block overrides does not lift the cap.
+        let huge = 1_000_000_000;
+        let output = EthCall::call(
+            &api,
+            TransactionRequest::default()
+                .with_from(sender)
+                .with_to(gas_at_entry)
+                .with_gas_limit(huge),
+            None,
+            EvmOverrides::default().with_block(Box::new(BlockOverrides {
+                gas_limit: Some(huge),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+        assert!(gas_left(&output) <= U256::from(BLOCK_GAS_LIMIT), "{output}");
     }
 
     #[tokio::test]

@@ -1786,6 +1786,95 @@ mod tests {
         assert!(gas < U256::from(MAX_TX_GAS_LIMIT_OSAKA), "estimate {gas} funds the reservoir");
     }
 
+    /// Under Amsterdam's EIP-8037, the estimate of a deployment that needs more than the execution
+    /// gas cap lets all of its nested creations succeed, even though they all fail at the cap.
+    #[tokio::test]
+    async fn estimate_gas_two_max_size_creations_amsterdam() {
+        const BLOCK_GAS_LIMIT: u64 = 200_000_000;
+        let sender = Address::repeat_byte(0x11);
+        let probe = Address::repeat_byte(0xcd);
+        let genesis = Genesis::default()
+            .with_gas_limit(BLOCK_GAS_LIMIT)
+            .with_base_fee(Some(0))
+            .extend_accounts([
+                (sender, GenesisAccount::default().with_balance(U256::from(10u128.pow(18)))),
+                (
+                    probe,
+                    // Returns the code size of the account in the calldata:
+                    //   PUSH0 CALLDATALOAD EXTCODESIZE PUSH0 MSTORE PUSH1 0x20 PUSH0 RETURN
+                    GenesisAccount::default()
+                        .with_code(Some(alloy_primitives::bytes!("5f353b5f5260205ff3"))),
+                ),
+            ]);
+        let chain_spec =
+            Arc::new(ChainSpecBuilder::mainnet().amsterdam_activated().genesis(genesis).build());
+        let factory = create_test_provider_factory_with_chain_spec(chain_spec);
+        init_genesis(&factory).unwrap();
+        let provider = BlockchainProvider::new(factory).unwrap();
+        let api = EthApiBuilder::new(
+            provider.clone(),
+            testing_pool(),
+            NoopNetwork::default(),
+            EthEvmConfig::new(provider.chain_spec()),
+        )
+        .build();
+        // Creates two contracts of 24,576 zero bytes each and ignores the results:
+        //   PUSH6 child PUSH1 0 MSTORE (PUSH1 6 PUSH1 26 PUSH1 0 CREATE POP) x2 STOP
+        // where child is PUSH2 0x6000 PUSH1 0 RETURN.
+        let deployment = TransactionRequest::default().with_from(sender).with_deploy_code(
+            alloy_primitives::bytes!("656160006000f36000526006601a6000f0506006601a6000f05000"),
+        );
+        let gas = EthCall::estimate_gas_at(
+            &api,
+            deployment.clone(),
+            BlockId::latest(),
+            EvmOverrides::default(),
+        )
+        .await
+        .unwrap();
+        assert!(gas > U256::from(MAX_TX_GAS_LIMIT_OSAKA), "{gas}");
+
+        // Deploys with `gas` as in a block, then returns the deployment's gas used and the code
+        // sizes of both creations.
+        let deploy = |gas: u64| {
+            let deployer = sender.create(0);
+            let code_size = |nonce: u64| {
+                TransactionRequest::default()
+                    .with_from(sender)
+                    .with_to(probe)
+                    .with_nonce(nonce)
+                    .with_gas_limit(100_000)
+                    .with_gas_price(0)
+                    .with_input(deployer.create(nonce).into_word())
+            };
+            let payload = SimulatePayload {
+                validation: true,
+                block_state_calls: vec![SimBlock::default()
+                    .call(deployment.clone().with_nonce(0).with_gas_limit(gas).with_gas_price(0))
+                    .call(code_size(1))
+                    .call(code_size(2))],
+                ..Default::default()
+            };
+            let api = api.clone();
+            async move {
+                let blocks = EthCall::simulate_v1(&api, payload, None).await.unwrap();
+                let calls = &blocks[0].calls;
+                assert!(calls[0].status, "{:?}", calls[0]);
+                let sizes: Vec<_> =
+                    calls[1..].iter().map(|call| U256::from_be_slice(&call.return_data)).collect();
+                (calls[0].gas_used, sizes)
+            }
+        };
+        let max_size = U256::from(24_576);
+
+        let (gas_used, sizes) = deploy(gas.to()).await;
+        assert_eq!(sizes, [max_size, max_size], "at {gas}");
+        // With only the gas the deployment uses, the second creation is starved, so the estimate
+        // must not settle there.
+        let (_, sizes) = deploy(gas_used).await;
+        assert_eq!(sizes, [max_size, U256::ZERO], "at {gas_used}");
+    }
+
     /// `eth_call`, `eth_estimateGas` and `eth_simulateV1` never cap a call that sets its gas below
     /// the block gas limit, so a transaction that fits in the block can be executed even when the
     /// RPC gas cap is lower. Calls that omit gas keep the cap as their default, and a block

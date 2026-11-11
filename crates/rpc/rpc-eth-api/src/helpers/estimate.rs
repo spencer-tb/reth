@@ -214,14 +214,25 @@ pub trait EstimateCall: Call {
         //
         // Under EIP-8037, gas above the execution gas cap only funds the state gas reservoir. A
         // transaction that completes a nested call only with a reservoir would otherwise be sized
-        // past the cap, so the execution at the cap is also a reference when it succeeds.
-        let mut allowed_failed_calls = failed_calls;
+        // past the cap, so for gas limits up to the cap the execution at the cap is also a
+        // reference when it succeeds. Above the cap only the execution at the highest gas limit
+        // is, so that a transaction that needs more than the cap, such as a large deployment, does
+        // not settle on a limit that starves one of its nested calls.
+        let reference_failed_calls = failed_calls;
+        let mut failed_calls_within_cap = reference_failed_calls;
         if execution_gas_cap < highest_gas_limit &&
             let Ok((capped, capped_failed_calls)) = execute(execution_gas_cap) &&
             capped.status
         {
-            allowed_failed_calls = allowed_failed_calls.max(capped_failed_calls);
+            failed_calls_within_cap = failed_calls_within_cap.max(capped_failed_calls);
         }
+        let allowed_failed_calls = |gas_limit: u64| {
+            if gas_limit <= execution_gas_cap {
+                failed_calls_within_cap
+            } else {
+                reference_failed_calls
+            }
+        };
 
         // At this point we know the call succeeded but want to find the _best_ (lowest) gas the
         // transaction succeeds with. We find this by doing a binary search over the possible range.
@@ -250,7 +261,7 @@ pub trait EstimateCall: Call {
             update_estimated_gas_range::<EvmTypesFor<Self::Evm>>(
                 res,
                 failed_calls,
-                allowed_failed_calls,
+                allowed_failed_calls(optimistic_gas_limit),
                 optimistic_gas_limit,
                 &mut highest_gas_limit,
                 &mut lowest_gas_limit,
@@ -296,7 +307,7 @@ pub trait EstimateCall: Call {
                     update_estimated_gas_range::<EvmTypesFor<Self::Evm>>(
                         res,
                         failed_calls,
-                        allowed_failed_calls,
+                        allowed_failed_calls(mid_gas_limit),
                         mid_gas_limit,
                         &mut highest_gas_limit,
                         &mut lowest_gas_limit,

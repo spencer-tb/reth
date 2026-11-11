@@ -1838,6 +1838,11 @@ mod tests {
             EthCall::call(&api, with_gas.clone(), None, EvmOverrides::default()).await.unwrap();
         assert!(gas_left(&output) >= U256::from(THRESHOLD), "{output}");
 
+        // An access list is for a transaction, so it keeps the cap and the call reverts.
+        let access_list =
+            EthCall::create_access_list_at(&api, with_gas.clone(), None, None).await.unwrap();
+        assert!(access_list.error.is_some(), "{access_list:?}");
+
         // Without an explicit gas, the default stays the cap.
         let output =
             EthCall::call(&api, without_gas.clone(), None, EvmOverrides::default()).await.unwrap();

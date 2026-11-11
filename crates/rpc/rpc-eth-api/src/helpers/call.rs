@@ -35,8 +35,8 @@ use reth_rpc_eth_types::{
         attach_bal_before_tx,
     },
     error::{AsEthApiError, FromEthApiError},
-    simulate::{self, EthSimulateError, SimulatedState},
-    utils::CallManyBudget,
+    simulate::{self, EthSimulateError, SimulateGasBudget, SimulatedState},
+    utils::{effective_gas_cap, CallManyBudget},
     EthApiError, RpcInvalidTransactionError, StateCacheDb,
 };
 use reth_storage_api::{BlockIdReader, ProviderTx, StateProvider};
@@ -128,8 +128,10 @@ pub trait EthCall: EstimateCall + LoadBlock + FullEthApiTypes {
                 let mut blocks: Vec<SimulatedBlock<RpcBlock<Self::NetworkTypes>>> =
                     Vec::with_capacity(block_state_calls.len());
 
-                let call_gas_limit = this.call_gas_limit();
-                let mut remaining_call_gas_limit = (call_gas_limit > 0).then_some(call_gas_limit);
+                // Calls that set `gas` may use a budget floored at the gas limit of the base
+                // block, calls that omit it keep the RPC gas cap.
+                let mut gas_budget =
+                    SimulateGasBudget::new(this.call_gas_limit(), parent.gas_limit());
 
                 for block in block_state_calls {
                     let SimBlock { block_overrides, state_overrides, calls } = block;
@@ -154,6 +156,8 @@ pub trait EthCall: EstimateCall + LoadBlock + FullEthApiTypes {
                     if !validation || !evm_env.version().feature(evm2::EvmFeatures::EIP8037) {
                         evm_env.version_mut().tx_gas_limit_cap = u64::MAX;
                     }
+                    // EIP-8037's total transaction gas cap applies in neither mode.
+                    evm_env.version_mut().tx_total_gas_cap = u64::MAX;
 
                     if !validation {
                         // If not explicitly required, we disable nonce check <https://github.com/paradigmxyz/reth/issues/16108>
@@ -242,7 +246,7 @@ pub trait EthCall: EstimateCall + LoadBlock + FullEthApiTypes {
                         builder,
                         &*state_provider,
                         calls,
-                        &mut remaining_call_gas_limit,
+                        &mut gas_budget,
                         chain_id,
                         simulation_state.as_mut(),
                         this.converter(),
@@ -475,12 +479,25 @@ pub trait EthCall: EstimateCall + LoadBlock + FullEthApiTypes {
     {
         self.spawn_with_state_at_block(at, |this, mut db| {
             let initial = request.as_ref().access_list().cloned().unwrap_or_default();
-            let (evm_env, mut tx_env) = this.prepare_call_env(
+            let requested_gas = request.as_ref().gas_limit();
+            let tx_gas_limit_cap = evm_env.version().tx_gas_limit_cap;
+            let tx_total_gas_cap = evm_env.version().tx_total_gas_cap;
+            let (mut evm_env, mut tx_env) = this.prepare_call_env(
                 evm_env,
                 request,
                 &mut db,
                 EvmOverrides::state(state_override),
             )?;
+            // The access list is for a transaction, so unlike a call it keeps Amsterdam's EIP-8037
+            // execution and total gas caps, and the RPC gas cap without the block gas limit floor.
+            if evm_env.version().feature(evm2::EvmFeatures::EIP8037) {
+                evm_env.version_mut().tx_gas_limit_cap = tx_gas_limit_cap;
+                evm_env.version_mut().tx_total_gas_cap = tx_total_gas_cap;
+            }
+            let gas_cap = this.call_gas_limit();
+            if requested_gas.is_some() && gas_cap != 0 && tx_env.gas_limit() > gas_cap {
+                tx_env.inner_mut().set_gas_limit(gas_cap);
+            }
             let chain_id = evm_env.chain_id();
 
             let mut evm = this.evm_config().evm_with_env(&mut db, evm_env);
@@ -912,6 +929,9 @@ pub trait Call:
     {
         // track whether the request has a gas limit set
         let requested_gas = request.as_ref().gas_limit();
+        // The gas limit of the block itself, which a block override must not lift the RPC gas cap
+        // to.
+        let header_gas_limit = evm_env.block_env().gas_limit.to::<u64>();
 
         // Disable block gas limit check to allow executing transactions with higher gas limit (call
         // gas limit): https://github.com/paradigmxyz/reth/issues/18577
@@ -927,11 +947,13 @@ pub trait Call:
         evm_env.version_mut().features.remove(evm2::EvmFeatures::BASE_FEE_CHECK);
 
         // Disable EIP-7825 transaction gas limit to support larger transactions. Under Amsterdam's
-        // EIP-8037 it only caps execution gas, the rest going to the state gas reservoir, so keep
-        // it to execute the call like a transaction.
-        if !evm_env.version().feature(evm2::EvmFeatures::EIP8037) {
-            evm_env.version_mut().tx_gas_limit_cap = u64::MAX;
-        }
+        // EIP-8037 it caps execution gas and intrinsic gas instead, so lifting it makes all of the
+        // call's gas execution gas and leaves no state gas reservoir.
+        evm_env.version_mut().tx_gas_limit_cap = u64::MAX;
+        // A call that omits gas still defaults to at most the gas limit a transaction may have.
+        let max_default_gas_limit = evm_env.version().tx_gas_caps().0;
+        // With the execution gas cap lifted, the EIP-8037 total gas cap does not apply either.
+        evm_env.version_mut().tx_total_gas_cap = u64::MAX;
 
         // Disable additional fee charges, e.g. opstack operator fee charge
         // See:
@@ -965,7 +987,8 @@ pub trait Call:
         let mut tx_env = self.create_txn_env(&evm_env, request, &mut *db)?;
 
         if let Some(requested_gas) = requested_gas {
-            let global_gas_cap = self.call_gas_limit();
+            // The RPC gas cap never limits an explicit gas limit below the block gas limit.
+            let global_gas_cap = effective_gas_cap(self.call_gas_limit(), header_gas_limit);
             if global_gas_cap != 0 && global_gas_cap < requested_gas {
                 // Callers routinely send gas limits above the cap, so this is not worth a warning.
                 // Log only the limits: the request carries caller calldata and addresses.
@@ -974,9 +997,7 @@ pub trait Call:
             }
         } else {
             // cap request's gas limit to call gas limit
-            tx_env
-                .inner_mut()
-                .set_gas_limit(self.call_gas_limit().min(evm_env.version().tx_gas_caps().0));
+            tx_env.inner_mut().set_gas_limit(self.call_gas_limit().min(max_default_gas_limit));
         }
 
         // lower the basefee to 0 to avoid breaking EVM invariants (basefee < gasprice): <https://github.com/ethereum/go-ethereum/blob/355228b011ef9a85ebc0f21e7196f892038d49f0/internal/ethapi/api.go#L700-L704>

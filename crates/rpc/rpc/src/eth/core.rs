@@ -536,7 +536,11 @@ mod tests {
     use super::*;
     use alloy_consensus::{Block, BlockBody, Header};
     use alloy_eips::{
-        eip4844::DATA_GAS_PER_BLOB, eip7702::Authorization, BlockId, BlockNumberOrTag,
+        eip2930::{AccessList, AccessListItem},
+        eip4844::DATA_GAS_PER_BLOB,
+        eip7702::Authorization,
+        eip7825::MAX_TX_GAS_LIMIT_OSAKA,
+        BlockId, BlockNumberOrTag,
     };
     use alloy_genesis::{Genesis, GenesisAccount};
     use alloy_network::TransactionBuilder;
@@ -1271,7 +1275,9 @@ mod tests {
             (50_000, None, 0, 100_000, 100_000, 50_000),
             (50_000, None, 1, 40_000, 100_000, 40_000),
             (50_000, None, 1, 100_000, 40_000, 40_000),
-            (50_000, Some(70_000), 1, 100_000, 100_000, 50_000),
+            // The RPC gas cap does not limit an explicit gas below the block gas limit.
+            (50_000, Some(70_000), 1, 100_000, 100_000, 70_000),
+            (50_000, Some(170_000), 1, 100_000, 100_000, 100_000),
             (50_000, Some(30_000), 1, 100_000, 100_000, 30_000),
             (50_000, Some(70_000), 1, 100_000, 40_000, 50_000),
             (50_000, Some(30_000), 1, 0, 100_000, 30_000),
@@ -1398,8 +1404,9 @@ mod tests {
             (sender, AccountOverride { balance: Some(U256::from(101_000)), ..Default::default() }),
             (contract, AccountOverride { code: Some(code), ..Default::default() }),
         ]);
-        // Omitted gas, and gas above the RPC cap.
-        for (gas, expected_gas) in [(None, 50_000), (Some(70_000), 50_000), (Some(30_000), 30_000)]
+        // Omitted gas, and gas above the RPC cap and the block gas limit it is floored at.
+        for (gas, expected_gas) in
+            [(None, 50_000), (Some(170_000), 100_000), (Some(30_000), 30_000)]
         {
             let request = TransactionRequest {
                 gas,
@@ -1477,7 +1484,13 @@ mod tests {
         let contract = Address::repeat_byte(0xaa);
         let mut state_override = StateOverride::default();
         state_override.insert(contract, AccountOverride { code: Some(code), ..Default::default() });
-        let overrides = EvmOverrides::state(Some(state_override));
+        // The RPC gas cap is floored at the block gas limit, so the block's own limit is below the
+        // low cap. A larger limit set through block overrides must not lift the cap.
+        let overrides =
+            EvmOverrides::state(Some(state_override)).with_block(Box::new(BlockOverrides {
+                gas_limit: Some(30_000_000),
+                ..Default::default()
+            }));
         let at = BlockId::latest();
 
         for chain_spec in [
@@ -1492,7 +1505,7 @@ mod tests {
                 Block {
                     header: Header {
                         number: 1,
-                        gas_limit: 30_000_000,
+                        gas_limit: 40_000,
                         excess_blob_gas: Some(0),
                         ..Default::default()
                     },
@@ -1604,18 +1617,24 @@ mod tests {
     #[tokio::test]
     async fn estimate_gas_transfer_respects_rpc_gas_cap() {
         let provider = MockEthProvider::default();
+        // The RPC gas cap is floored at the block gas limit, so the block's own limit is below the
+        // caps. A larger limit set through block overrides must not lift the cap.
         provider.add_block(
             B256::repeat_byte(0x42),
             Block {
-                header: Header { number: 1, gas_limit: 30_000_000, ..Default::default() },
+                header: Header { number: 1, gas_limit: 20_000, ..Default::default() },
                 body: BlockBody::default(),
             },
         );
         let request = TransactionRequest::default().with_to(Address::repeat_byte(0xaa));
         let at = BlockId::latest();
+        let overrides = EvmOverrides::default().with_block(Box::new(BlockOverrides {
+            gas_limit: Some(30_000_000),
+            ..Default::default()
+        }));
 
         let capped = build_test_eth_api_with_gas_cap(provider.clone(), 20_999);
-        let err = EthCall::estimate_gas_at(&capped, request.clone(), at, EvmOverrides::default())
+        let err = EthCall::estimate_gas_at(&capped, request.clone(), at, overrides.clone())
             .await
             .expect_err("the transfer shortcut must respect the RPC gas cap");
         assert!(
@@ -1627,10 +1646,577 @@ mod tests {
         );
 
         let sufficient = build_test_eth_api_with_gas_cap(provider, 21_000);
-        let estimated = EthCall::estimate_gas_at(&sufficient, request, at, EvmOverrides::default())
+        let estimated =
+            EthCall::estimate_gas_at(&sufficient, request, at, overrides).await.unwrap();
+        assert_eq!(estimated, U256::from(21_000));
+    }
+
+    /// Returns code that calls `target` with the gas that `gas` pushes and returns whether the call
+    /// succeeded: PUSH1 0 (x5) PUSH20 target `gas` CALL PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN.
+    fn call_and_return_success(target: Address, gas: &[u8]) -> Bytes {
+        [
+            &alloy_primitives::hex!("6000600060006000600073")[..],
+            target.as_slice(),
+            gas,
+            &alloy_primitives::hex!("f160005260206000f3"),
+        ]
+        .concat()
+        .into()
+    }
+
+    /// `eth_estimateGas` does not return a gas limit that starves a nested call which the caller
+    /// catches, while a nested call that fails at any gas limit leaves the estimate alone.
+    #[tokio::test]
+    async fn estimate_gas_does_not_starve_nested_calls() {
+        let sender = Address::repeat_byte(0x11);
+        let burner = Address::repeat_byte(0xb0);
+        let catcher = Address::repeat_byte(0xca);
+        let prober = Address::repeat_byte(0xcb);
+        let overrides = EvmOverrides::state(Some(StateOverride::from_iter([
+            (
+                burner,
+                // Loops 3000 times, about 78,000 gas:
+                //   PUSH2 3000 JUMPDEST PUSH1 1 SWAP1 SUB DUP1 PUSH1 3 JUMPI STOP
+                AccountOverride {
+                    code: Some(alloy_primitives::bytes!("610bb85b600190038060035700")),
+                    ..Default::default()
+                },
+            ),
+            (
+                catcher,
+                // Calls the burner with all gas left: GAS
+                AccountOverride {
+                    code: Some(call_and_return_success(burner, &[0x5a])),
+                    ..Default::default()
+                },
+            ),
+            (
+                prober,
+                // Calls the burner with 1,000 gas, which always runs out: PUSH2 1000
+                AccountOverride {
+                    code: Some(call_and_return_success(burner, &[0x61, 0x03, 0xe8])),
+                    ..Default::default()
+                },
+            ),
+        ])));
+        let at = BlockId::latest();
+
+        for chain_spec in [
+            ChainSpecBuilder::mainnet().cancun_activated().build(),
+            ChainSpecBuilder::mainnet().amsterdam_activated().build(),
+        ] {
+            let provider = MockEthProvider::default().with_chain_spec(chain_spec);
+            provider.add_block(
+                B256::repeat_byte(0x42),
+                Block {
+                    header: Header {
+                        number: 1,
+                        gas_limit: 30_000_000,
+                        excess_blob_gas: Some(0),
+                        ..Default::default()
+                    },
+                    body: BlockBody::default(),
+                },
+            );
+            let api = build_test_eth_api(provider);
+
+            // The estimate must leave the burner enough gas to finish.
+            let request = TransactionRequest::default().with_from(sender).with_to(catcher);
+            let gas = EthCall::estimate_gas_at(&api, request.clone(), at, overrides.clone())
+                .await
+                .unwrap();
+            let output =
+                EthCall::call(&api, request.with_gas_limit(gas.to()), Some(at), overrides.clone())
+                    .await
+                    .unwrap();
+            assert_eq!(U256::from_be_slice(&output), U256::ONE, "nested call fails at {gas}");
+
+            // A nested call that runs out of gas at every limit must not inflate the estimate.
+            let request = TransactionRequest::default().with_from(sender).with_to(prober);
+            let gas = EthCall::estimate_gas_at(&api, request, at, overrides.clone()).await.unwrap();
+            assert!(gas <= U256::from(100_000), "estimate {gas} inflated by a failing nested call");
+        }
+    }
+
+    /// Under Amsterdam's EIP-8037, a nested call that only completes when a state gas reservoir
+    /// pays for it does not push the estimate past the execution gas cap.
+    #[tokio::test]
+    async fn estimate_gas_nested_call_reservoir_amsterdam() {
+        let sender = Address::repeat_byte(0x11);
+        let storer = Address::repeat_byte(0xb1);
+        let catcher = Address::repeat_byte(0xca);
+        let overrides = EvmOverrides::state(Some(StateOverride::from_iter([
+            (
+                storer,
+                // Sets a fresh storage slot: PUSH1 1 PUSH1 0 SSTORE STOP
+                AccountOverride {
+                    code: Some(alloy_primitives::bytes!("600160005500")),
+                    ..Default::default()
+                },
+            ),
+            (
+                catcher,
+                // Calls the storer with 30,000 gas, too little for the new slot's state gas unless
+                // a reservoir pays it: PUSH2 30000
+                AccountOverride {
+                    code: Some(call_and_return_success(storer, &[0x61, 0x75, 0x30])),
+                    ..Default::default()
+                },
+            ),
+        ])));
+        let provider = MockEthProvider::default()
+            .with_chain_spec(ChainSpecBuilder::mainnet().amsterdam_activated().build());
+        provider.add_block(
+            B256::repeat_byte(0x42),
+            Block {
+                header: Header {
+                    number: 1,
+                    gas_limit: 60_000_000,
+                    excess_blob_gas: Some(0),
+                    ..Default::default()
+                },
+                body: BlockBody::default(),
+            },
+        );
+        let api = build_test_eth_api_with_gas_cap(provider, 50_000_000);
+
+        let request = TransactionRequest::default().with_from(sender).with_to(catcher);
+        let gas =
+            EthCall::estimate_gas_at(&api, request, BlockId::latest(), overrides).await.unwrap();
+        assert!(gas < U256::from(MAX_TX_GAS_LIMIT_OSAKA), "estimate {gas} funds the reservoir");
+    }
+
+    /// Under Amsterdam's EIP-8037, the estimate of a deployment that needs more than the execution
+    /// gas cap lets all of its nested creations succeed, even though they all fail at the cap.
+    #[tokio::test]
+    async fn estimate_gas_two_max_size_creations_amsterdam() {
+        const BLOCK_GAS_LIMIT: u64 = 200_000_000;
+        let sender = Address::repeat_byte(0x11);
+        let probe = Address::repeat_byte(0xcd);
+        let genesis = Genesis::default()
+            .with_gas_limit(BLOCK_GAS_LIMIT)
+            .with_base_fee(Some(0))
+            .extend_accounts([
+                (sender, GenesisAccount::default().with_balance(U256::from(10u128.pow(18)))),
+                (
+                    probe,
+                    // Returns the code size of the account in the calldata:
+                    //   PUSH0 CALLDATALOAD EXTCODESIZE PUSH0 MSTORE PUSH1 0x20 PUSH0 RETURN
+                    GenesisAccount::default()
+                        .with_code(Some(alloy_primitives::bytes!("5f353b5f5260205ff3"))),
+                ),
+            ]);
+        let chain_spec =
+            Arc::new(ChainSpecBuilder::mainnet().amsterdam_activated().genesis(genesis).build());
+        let factory = create_test_provider_factory_with_chain_spec(chain_spec);
+        init_genesis(&factory).unwrap();
+        let provider = BlockchainProvider::new(factory).unwrap();
+        let api = EthApiBuilder::new(
+            provider.clone(),
+            testing_pool(),
+            NoopNetwork::default(),
+            EthEvmConfig::new(provider.chain_spec()),
+        )
+        .build();
+        // Creates two contracts of 24,576 zero bytes each and ignores the results:
+        //   PUSH6 child PUSH1 0 MSTORE (PUSH1 6 PUSH1 26 PUSH1 0 CREATE POP) x2 STOP
+        // where child is PUSH2 0x6000 PUSH1 0 RETURN.
+        let deployment = TransactionRequest::default().with_from(sender).with_deploy_code(
+            alloy_primitives::bytes!("656160006000f36000526006601a6000f0506006601a6000f05000"),
+        );
+        let gas = EthCall::estimate_gas_at(
+            &api,
+            deployment.clone(),
+            BlockId::latest(),
+            EvmOverrides::default(),
+        )
+        .await
+        .unwrap();
+        assert!(gas > U256::from(MAX_TX_GAS_LIMIT_OSAKA), "{gas}");
+
+        // Deploys with `gas` as in a block, then returns the deployment's gas used and the code
+        // sizes of both creations.
+        let deploy = |gas: u64| {
+            let deployer = sender.create(0);
+            let code_size = |nonce: u64| {
+                TransactionRequest::default()
+                    .with_from(sender)
+                    .with_to(probe)
+                    .with_nonce(nonce)
+                    .with_gas_limit(100_000)
+                    .with_gas_price(0)
+                    .with_input(deployer.create(nonce).into_word())
+            };
+            let payload = SimulatePayload {
+                validation: true,
+                block_state_calls: vec![SimBlock::default()
+                    .call(deployment.clone().with_nonce(0).with_gas_limit(gas).with_gas_price(0))
+                    .call(code_size(1))
+                    .call(code_size(2))],
+                ..Default::default()
+            };
+            let api = api.clone();
+            async move {
+                let blocks = EthCall::simulate_v1(&api, payload, None).await.unwrap();
+                let calls = &blocks[0].calls;
+                assert!(calls[0].status, "{:?}", calls[0]);
+                let sizes: Vec<_> =
+                    calls[1..].iter().map(|call| U256::from_be_slice(&call.return_data)).collect();
+                (calls[0].gas_used, sizes)
+            }
+        };
+        let max_size = U256::from(24_576);
+
+        let (gas_used, sizes) = deploy(gas.to()).await;
+        assert_eq!(sizes, [max_size, max_size], "at {gas}");
+        // With only the gas the deployment uses, the second creation is starved, so the estimate
+        // must not settle there.
+        let (_, sizes) = deploy(gas_used).await;
+        assert_eq!(sizes, [max_size, U256::ZERO], "at {gas_used}");
+    }
+
+    /// As in geth, `eth_estimateGas` searches up to a request's gas limit above the block gas
+    /// limit, within the RPC gas cap, while a request that omits gas searches up to the block
+    /// gas limit.
+    #[tokio::test]
+    async fn estimate_gas_request_gas_above_block_gas_limit() {
+        const BLOCK_GAS_LIMIT: u64 = 60_000_000;
+        const GAS_CAP: u64 = 100_000_000;
+        let provider = MockEthProvider::default()
+            .with_chain_spec(ChainSpecBuilder::mainnet().amsterdam_activated().build());
+        provider.add_block(
+            B256::repeat_byte(0x42),
+            Block {
+                header: Header {
+                    number: 1,
+                    gas_limit: BLOCK_GAS_LIMIT,
+                    excess_blob_gas: Some(0),
+                    ..Default::default()
+                },
+                body: BlockBody::default(),
+            },
+        );
+        let api = build_test_eth_api_with_gas_cap(provider, GAS_CAP);
+        // Creates two contracts of 24,576 zero bytes each, which needs about 76M gas, see
+        // `estimate_gas_two_max_size_creations_amsterdam`.
+        let deployment =
+            TransactionRequest::default().with_from(Address::repeat_byte(0x11)).with_deploy_code(
+                alloy_primitives::bytes!("656160006000f36000526006601a6000f0506006601a6000f05000"),
+            );
+        let at = BlockId::latest();
+
+        let gas = EthCall::estimate_gas_at(
+            &api,
+            deployment.clone().with_gas_limit(GAS_CAP),
+            at,
+            EvmOverrides::default(),
+        )
+        .await
+        .unwrap();
+        assert!(gas > U256::from(BLOCK_GAS_LIMIT), "{gas}");
+        assert!(gas <= U256::from(GAS_CAP), "{gas}");
+
+        let gas =
+            EthCall::estimate_gas_at(&api, deployment, at, EvmOverrides::default()).await.unwrap();
+        assert!(gas <= U256::from(BLOCK_GAS_LIMIT), "{gas}");
+    }
+
+    /// A request's gas limit bounds the estimate once it covers the fork's minimum transaction
+    /// cost: 21,000 before Amsterdam and 12,000 from Amsterdam (EIP-2780). A lower one is ignored.
+    #[tokio::test]
+    async fn estimate_gas_request_gas_from_minimum_transaction_cost() {
+        let sender = Address::repeat_byte(0x11);
+        let request = |gas: u64| {
+            TransactionRequest::default()
+                .with_from(sender)
+                .with_to(Address::repeat_byte(0xaa))
+                .with_gas_limit(gas)
+        };
+        let at = BlockId::latest();
+
+        // A zero-value transfer costs 21,000 before Amsterdam and 15,000 from Amsterdam.
+        for (chain_spec, gas, expected) in [
+            (ChainSpecBuilder::mainnet().cancun_activated().build(), 14_000, Some(21_000)),
+            (ChainSpecBuilder::mainnet().amsterdam_activated().build(), 14_000, None),
+            (ChainSpecBuilder::mainnet().amsterdam_activated().build(), 11_000, Some(15_000)),
+            (ChainSpecBuilder::mainnet().amsterdam_activated().build(), 16_000, Some(15_000)),
+        ] {
+            let provider = MockEthProvider::default().with_chain_spec(chain_spec);
+            provider.add_account(sender, ExtendedAccount::new(0, U256::from(1_000_000)));
+            provider.add_block(
+                B256::repeat_byte(0x42),
+                Block {
+                    header: Header {
+                        number: 1,
+                        gas_limit: 30_000_000,
+                        excess_blob_gas: Some(0),
+                        ..Default::default()
+                    },
+                    body: BlockBody::default(),
+                },
+            );
+            let api = build_test_eth_api(provider);
+            let result =
+                EthCall::estimate_gas_at(&api, request(gas), at, EvmOverrides::default()).await;
+            match expected {
+                Some(expected) => assert_eq!(result.unwrap(), U256::from(expected), "gas {gas}"),
+                // The 14,000 request bounds the transfer, which needs more.
+                None => {
+                    let err = result.expect_err("a request below the transfer's cost must fail");
+                    assert!(
+                        matches!(
+                            err.as_invalid_transaction(),
+                            Some(RpcInvalidTransactionError::GasRequiredExceedsAllowance {
+                                gas_limit: 14_000
+                            })
+                        ),
+                        "{err}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `eth_call`, `eth_estimateGas` and `eth_simulateV1` never cap a call that sets its gas below
+    /// the block gas limit, so a transaction that fits in the block can be executed even when the
+    /// RPC gas cap is lower. Calls that omit gas keep the cap as their default, and a block
+    /// override of the gas limit does not lift the cap.
+    #[tokio::test]
+    async fn rpc_gas_cap_never_limits_explicit_gas_below_block_gas_limit() {
+        // Gas the contract needs at entry, above the RPC gas cap.
+        const THRESHOLD: u64 = 12_000_000;
+        const GAS_CAP: u64 = 10_000_000;
+        const BLOCK_GAS_LIMIT: u64 = 30_000_000;
+        let sender = Address::repeat_byte(0x11);
+        let needs_gas = Address::repeat_byte(0xaa);
+        let gas_at_entry = Address::repeat_byte(0xab);
+        let genesis = Genesis::default()
+            .with_gas_limit(BLOCK_GAS_LIMIT)
+            .with_base_fee(Some(0))
+            .extend_accounts([
+                (sender, GenesisAccount::default().with_balance(U256::from(10u128.pow(18)))),
+                (
+                    needs_gas,
+                    // Returns the gas left at entry if it is at least THRESHOLD, reverts
+                    // otherwise: GAS PUSH4 THRESHOLD DUP2 LT PUSH1 0x11 JUMPI PUSH0 MSTORE
+                    // PUSH1 0x20 PUSH0 RETURN JUMPDEST PUSH0 PUSH0 REVERT
+                    GenesisAccount::default().with_code(Some(alloy_primitives::bytes!(
+                        "5a6300b71b0081106011575f5260205ff35b5f5ffd"
+                    ))),
+                ),
+                (
+                    gas_at_entry,
+                    // Returns the gas left at entry: GAS PUSH0 MSTORE PUSH1 0x20 PUSH0 RETURN
+                    GenesisAccount::default()
+                        .with_code(Some(alloy_primitives::bytes!("5a5f5260205ff3"))),
+                ),
+            ]);
+        let chain_spec =
+            Arc::new(ChainSpecBuilder::mainnet().amsterdam_activated().genesis(genesis).build());
+        let factory = create_test_provider_factory_with_chain_spec(chain_spec);
+        init_genesis(&factory).unwrap();
+        let provider = BlockchainProvider::new(factory).unwrap();
+        let api = EthApiBuilder::new(
+            provider.clone(),
+            testing_pool(),
+            NoopNetwork::default(),
+            EthEvmConfig::new(provider.chain_spec()),
+        )
+        .gas_cap(GAS_CAP.into())
+        .build();
+        let gas_left = |output: &Bytes| U256::from_be_slice(output);
+        let request = TransactionRequest::default().with_from(sender).with_to(needs_gas);
+        let with_gas = request.clone().with_gas_limit(20_000_000);
+        let without_gas = TransactionRequest::default().with_from(sender).with_to(gas_at_entry);
+
+        // An explicit gas above the cap is allowed up to the block gas limit.
+        let output =
+            EthCall::call(&api, with_gas.clone(), None, EvmOverrides::default()).await.unwrap();
+        assert!(gas_left(&output) >= U256::from(THRESHOLD), "{output}");
+
+        // An access list is for a transaction, so it keeps the cap and the call reverts.
+        let access_list =
+            EthCall::create_access_list_at(&api, with_gas.clone(), None, None).await.unwrap();
+        assert!(access_list.error.is_some(), "{access_list:?}");
+
+        // Without an explicit gas, the default stays the cap.
+        let output =
+            EthCall::call(&api, without_gas.clone(), None, EvmOverrides::default()).await.unwrap();
+        assert!(gas_left(&output) <= U256::from(GAS_CAP), "{output}");
+
+        // The estimate's search reaches the block gas limit.
+        let estimated =
+            EthCall::estimate_gas_at(&api, request, BlockId::latest(), EvmOverrides::default())
+                .await
+                .unwrap();
+        assert!(estimated >= U256::from(THRESHOLD), "{estimated}");
+        assert!(estimated <= U256::from(BLOCK_GAS_LIMIT), "{estimated}");
+
+        // The same holds for the calls of a simulated block.
+        let blocks = EthCall::simulate_v1(
+            &api,
+            SimulatePayload {
+                block_state_calls: vec![SimBlock::default().call(with_gas).call(without_gas)],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let calls = &blocks[0].calls;
+        assert!(calls[0].status, "{:?}", calls[0]);
+        assert!(gas_left(&calls[0].return_data) >= U256::from(THRESHOLD));
+        assert!(calls[1].status, "{:?}", calls[1]);
+        assert!(gas_left(&calls[1].return_data) <= U256::from(GAS_CAP));
+
+        // A larger block gas limit set through block overrides does not lift the cap.
+        let huge = 1_000_000_000;
+        let output = EthCall::call(
+            &api,
+            TransactionRequest::default()
+                .with_from(sender)
+                .with_to(gas_at_entry)
+                .with_gas_limit(huge),
+            None,
+            EvmOverrides::default().with_block(Box::new(BlockOverrides {
+                gas_limit: Some(huge),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+        assert!(gas_left(&output) <= U256::from(BLOCK_GAS_LIMIT), "{output}");
+    }
+
+    /// Under Amsterdam's EIP-8037, `eth_call` and `eth_simulateV1` without validation make all of
+    /// a call's gas execution gas, and allow intrinsic gas above the execution gas cap, while
+    /// `eth_simulateV1` with validation executes the call as a transaction.
+    #[tokio::test]
+    async fn call_and_simulate_execution_gas_cap_amsterdam() {
+        const BLOCK_GAS_LIMIT: u64 = 30_000_000;
+        let sender = Address::repeat_byte(0x11);
+        let gas_at_entry = Address::repeat_byte(0xab);
+        let genesis = Genesis::default()
+            .with_gas_limit(BLOCK_GAS_LIMIT)
+            .with_base_fee(Some(0))
+            .extend_accounts([
+                (sender, GenesisAccount::default().with_balance(U256::from(10u128.pow(18)))),
+                (
+                    gas_at_entry,
+                    // Returns the gas left at entry: GAS PUSH0 MSTORE PUSH1 0x20 PUSH0 RETURN
+                    GenesisAccount::default()
+                        .with_code(Some(alloy_primitives::bytes!("5a5f5260205ff3"))),
+                ),
+            ]);
+        let chain_spec =
+            Arc::new(ChainSpecBuilder::mainnet().amsterdam_activated().genesis(genesis).build());
+        let factory = create_test_provider_factory_with_chain_spec(chain_spec);
+        init_genesis(&factory).unwrap();
+        let provider = BlockchainProvider::new(factory).unwrap();
+        let api = EthApiBuilder::new(
+            provider.clone(),
+            testing_pool(),
+            NoopNetwork::default(),
+            EthEvmConfig::new(provider.chain_spec()),
+        )
+        .build();
+        let gas_left = |output: &Bytes| U256::from_be_slice(output);
+        let execution_gas_cap = U256::from(MAX_TX_GAS_LIMIT_OSAKA);
+        let request = TransactionRequest::default()
+            .with_from(sender)
+            .with_to(gas_at_entry)
+            .with_gas_limit(20_000_000);
+
+        let output =
+            EthCall::call(&api, request.clone(), None, EvmOverrides::default()).await.unwrap();
+        assert!(gas_left(&output) > execution_gas_cap, "{output}");
+
+        // At about 4,000 gas per storage key, the access list costs about 20M intrinsic gas.
+        let storage_keys = (0..5_000u64).map(|key| B256::from(U256::from(key))).collect();
+        let large_intrinsic =
+            request.clone().with_gas_limit(BLOCK_GAS_LIMIT).with_access_list(AccessList(vec![
+                AccessListItem { address: gas_at_entry, storage_keys },
+            ]));
+        let output =
+            EthCall::call(&api, large_intrinsic, None, EvmOverrides::default()).await.unwrap();
+        assert!(
+            gas_left(&output) < U256::from(BLOCK_GAS_LIMIT - MAX_TX_GAS_LIMIT_OSAKA),
+            "{output}"
+        );
+
+        for validation in [false, true] {
+            let blocks = EthCall::simulate_v1(
+                &api,
+                SimulatePayload {
+                    validation,
+                    block_state_calls: vec![
+                        SimBlock::default().call(request.clone().with_nonce(0).with_gas_price(0))
+                    ],
+                    ..Default::default()
+                },
+                None,
+            )
             .await
             .unwrap();
-        assert_eq!(estimated, U256::from(21_000));
+            let call = &blocks[0].calls[0];
+            assert!(call.status, "{call:?}");
+            assert_eq!(
+                gas_left(&call.return_data) > execution_gas_cap,
+                !validation,
+                "validation: {validation}"
+            );
+        }
+    }
+
+    /// With Amsterdam's EIP-8037 execution gas cap lifted, `eth_call` does not apply the total gas
+    /// cap of a transaction either, while `eth_createAccessList` keeps it.
+    #[tokio::test]
+    async fn call_gas_above_total_gas_cap_amsterdam() {
+        const GAS: u64 = 5_000_000_000;
+        let total_gas_cap = u64::from(u32::MAX);
+        let provider = MockEthProvider::default()
+            .with_chain_spec(ChainSpecBuilder::mainnet().amsterdam_activated().build());
+        provider.add_block(
+            B256::repeat_byte(0x42),
+            Block {
+                header: Header {
+                    number: 1,
+                    gas_limit: GAS,
+                    excess_blob_gas: Some(0),
+                    ..Default::default()
+                },
+                body: BlockBody::default(),
+            },
+        );
+        let api = build_test_eth_api_with_gas_cap(provider, GAS);
+        let gas_at_entry = Address::repeat_byte(0xab);
+        let state_override = StateOverride::from_iter([(
+            gas_at_entry,
+            // Returns the gas left at entry: GAS PUSH0 MSTORE PUSH1 0x20 PUSH0 RETURN
+            AccountOverride {
+                code: Some(alloy_primitives::bytes!("5a5f5260205ff3")),
+                ..Default::default()
+            },
+        )]);
+        let request = TransactionRequest::default()
+            .with_from(Address::repeat_byte(0x11))
+            .with_to(gas_at_entry)
+            .with_gas_limit(GAS);
+
+        let output = EthCall::call(
+            &api,
+            request.clone(),
+            None,
+            EvmOverrides::state(Some(state_override.clone())),
+        )
+        .await
+        .unwrap();
+        assert!(U256::from_be_slice(&output) > U256::from(total_gas_cap), "{output}");
+
+        // An access list is for a transaction, so it keeps the total gas cap.
+        assert!(EthCall::create_access_list_at(&api, request, None, Some(state_override))
+            .await
+            .is_err());
     }
 
     #[tokio::test]

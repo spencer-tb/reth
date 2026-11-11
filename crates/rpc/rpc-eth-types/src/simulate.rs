@@ -2,6 +2,7 @@
 
 use crate::{
     error::{api::FromEthApiError, FromEvmError, ToRpcError},
+    utils::effective_gas_cap,
     EthApiError,
 };
 use alloy_chains::Chain;
@@ -299,15 +300,59 @@ pub fn apply_precompile_overrides(
     Ok(())
 }
 
+/// Gas budget that the calls of an `eth_simulateV1` request share across its blocks.
+///
+/// Calls that set `gas` draw on the RPC gas cap floored at the gas limit of the base block, see
+/// [`effective_gas_cap`]. Calls that omit `gas` default to at most the gas left of the RPC gas cap
+/// itself, so their defaults and budget exhaustion do not change with the floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SimulateGasBudget {
+    /// Gas left for calls that set `gas`, `None` if the RPC gas cap is disabled.
+    remaining: Option<u64>,
+    /// Gas left of the RPC gas cap, which bounds calls that omit `gas`, `None` if it is disabled.
+    remaining_default: Option<u64>,
+}
+
+impl SimulateGasBudget {
+    /// Creates the budget of a request under the RPC gas cap `gas_cap`, simulated on top of a base
+    /// block with the gas limit `base_block_gas_limit`. A `gas_cap` of `0` disables the budget.
+    pub fn new(gas_cap: u64, base_block_gas_limit: u64) -> Self {
+        let enabled = gas_cap != 0;
+        Self {
+            remaining: enabled.then(|| effective_gas_cap(gas_cap, base_block_gas_limit)),
+            remaining_default: enabled.then_some(gas_cap),
+        }
+    }
+
+    /// Charges the gas a call used against the budget it drew on.
+    ///
+    /// Returns [`EthSimulateError::GasLimitReached`] if the call used more gas than is left.
+    fn charge(&mut self, gas_used: u64, explicit_gas: bool) -> Result<(), EthApiError> {
+        let reached = || EthApiError::other(EthSimulateError::GasLimitReached);
+        if let Some(remaining) = &mut self.remaining {
+            *remaining = remaining.checked_sub(gas_used).ok_or_else(reached)?;
+        }
+        if let Some(remaining) = &mut self.remaining_default {
+            *remaining = if explicit_gas {
+                // A call that sets `gas` may use more than the RPC gas cap.
+                remaining.saturating_sub(gas_used)
+            } else {
+                remaining.checked_sub(gas_used).ok_or_else(reached)?
+            };
+        }
+        Ok(())
+    }
+}
+
 /// Converts all [`TransactionRequest`]s into [`Recovered`] transactions and applies them to the
 /// given [`BlockBuilder`].
 ///
 /// Returns all executed transactions and the result of the execution.
 ///
 /// For each call without an explicit `gas` field, the remaining block gas is used as the default.
-/// The RPC gas cap is tracked as a request-wide remaining budget and caps each call before
-/// execution. This matches the spec rule `"gasLimit: blockGasLimit - soFarUsedGasInBlock"` and
-/// geth's per-call `sanitizeCall` behavior.
+/// The request-wide [`SimulateGasBudget`] caps each call before execution. This matches the spec
+/// rule `"gasLimit: blockGasLimit - soFarUsedGasInBlock"` and geth's per-call `sanitizeCall`
+/// behavior.
 ///
 /// [`TransactionRequest`]: alloy_rpc_types_eth::TransactionRequest
 #[expect(clippy::type_complexity)]
@@ -315,7 +360,7 @@ pub fn execute_transactions<S, T, EvmTypes>(
     mut builder: S,
     state_provider: impl StateProvider,
     calls: Vec<RpcTxReq<T::Network>>,
-    remaining_call_gas_limit: &mut Option<u64>,
+    gas_budget: &mut SimulateGasBudget,
     chain_id: u64,
     simulation_state: Option<&mut SimulatedState>,
     converter: &T,
@@ -361,14 +406,15 @@ where
             return Err(EthApiError::other(EthSimulateError::BlockGasLimitExceeded))
         }
 
-        if let Some(remaining_call_gas_limit) = *remaining_call_gas_limit {
-            if let Some(gas_limit) = call.as_ref().gas_limit() {
-                if gas_limit > remaining_call_gas_limit {
-                    call.as_mut().set_gas_limit(remaining_call_gas_limit);
-                }
-            } else {
-                default_gas_limit = default_gas_limit.min(remaining_call_gas_limit);
+        let explicit_gas = call.as_ref().gas_limit().is_some();
+        if let Some(gas_limit) = call.as_ref().gas_limit() {
+            if let Some(remaining) = gas_budget.remaining &&
+                gas_limit > remaining
+            {
+                call.as_mut().set_gas_limit(remaining);
             }
+        } else if let Some(remaining) = gas_budget.remaining_default {
+            default_gas_limit = default_gas_limit.min(remaining);
         }
 
         // Resolve transaction, populate missing fields and enforce calls
@@ -406,12 +452,7 @@ where
         }
 
         let gas_used = gas_output.tx_gas_used();
-        if let Some(remaining_call_gas_limit) = remaining_call_gas_limit.as_mut() {
-            if gas_used > *remaining_call_gas_limit {
-                return Err(EthApiError::other(EthSimulateError::GasLimitReached))
-            }
-            *remaining_call_gas_limit -= gas_used;
-        }
+        gas_budget.charge(gas_used, explicit_gas)?;
 
         cumulative_tx_gas_used = cumulative_tx_gas_used.saturating_add(gas_used);
         block_regular_gas_used = block_regular_gas_used.saturating_add(tx_regular_gas_used);
@@ -714,7 +755,7 @@ impl SimulatedState {
 mod tests {
     use super::{
         apply_precompile_overrides, sanitize_chain, EthSimulateError, ProviderResult,
-        SimulatedState, INTERNAL_ERROR_CODE,
+        SimulateGasBudget, SimulatedState, INTERNAL_ERROR_CODE,
     };
     use crate::{cache::db::apply_state_overrides_with_state, error::ToRpcError, EthApiError};
     use alloy_chains::Chain;
@@ -796,6 +837,39 @@ mod tests {
             }
             Ok(hashed)
         }
+    }
+
+    #[test]
+    fn gas_budget_floors_explicit_gas_at_block_gas_limit() {
+        let reached = |result: Result<(), EthApiError>| {
+            matches!(
+                result,
+                Err(EthApiError::Other(err)) if err.to_string() ==
+                    EthSimulateError::GasLimitReached.to_string()
+            )
+        };
+
+        // Calls that set gas may use up to the block gas limit, while calls that omit it only
+        // get what is left of the RPC gas cap.
+        let mut budget = SimulateGasBudget::new(50, 80);
+        assert_eq!(budget.remaining, Some(80));
+        assert_eq!(budget.remaining_default, Some(50));
+        budget.charge(60, true).unwrap();
+        assert_eq!(budget.remaining, Some(20));
+        assert_eq!(budget.remaining_default, Some(0));
+        assert!(reached(budget.charge(1, false)));
+
+        // Without explicit gas the budget behaves as the RPC gas cap alone.
+        let mut budget = SimulateGasBudget::new(50, 80);
+        budget.charge(30, false).unwrap();
+        assert_eq!(budget.remaining_default, Some(20));
+        assert!(reached(budget.charge(21, false)));
+
+        // A cap above the block gas limit is kept, and a zero cap disables the budget.
+        assert_eq!(SimulateGasBudget::new(50, 30).remaining, Some(50));
+        let mut unlimited = SimulateGasBudget::new(0, 80);
+        unlimited.charge(u64::MAX, false).unwrap();
+        assert_eq!(unlimited, SimulateGasBudget { remaining: None, remaining_default: None });
     }
 
     #[test]

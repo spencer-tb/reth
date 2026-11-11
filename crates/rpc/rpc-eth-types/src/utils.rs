@@ -104,6 +104,20 @@ pub fn checked_blob_gas_used_ratio(blob_gas_used: u64, max_blob_gas_per_block: u
     }
 }
 
+/// Returns the RPC gas cap to apply to a call that sets its gas limit, on a block with
+/// `block_gas_limit`.
+///
+/// A transaction that fits in the block can be included, so it can also be executed: a cap below
+/// the block gas limit is raised to it. `block_gas_limit` must be the gas limit of the block
+/// itself, not one set by block overrides, so that a request cannot lift the cap. A `gas_cap` of
+/// `0` disables the cap and is returned as is.
+pub fn effective_gas_cap(gas_cap: u64, block_gas_limit: u64) -> u64 {
+    if gas_cap == 0 {
+        return 0
+    }
+    gas_cap.max(block_gas_limit)
+}
+
 /// Bounds the work of one `eth_callMany`, `trace_callMany` or `debug_traceCallMany` request.
 ///
 /// The request may carry at most [`DEFAULT_MAX_CALL_MANY_CALLS`] calls, all of its calls share
@@ -267,6 +281,13 @@ mod tests {
         let mut unlimited = CallManyBudget::new(3, 0).unwrap();
         unlimited.charge(&tx_result(u64::MAX, InstrStop::Stop)).unwrap();
         assert_eq!(admitted(&mut unlimited, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn effective_gas_cap_never_below_block_gas_limit() {
+        assert_eq!(effective_gas_cap(50_000_000, 60_000_000), 60_000_000);
+        assert_eq!(effective_gas_cap(50_000_000, 30_000_000), 50_000_000);
+        assert_eq!(effective_gas_cap(0, 60_000_000), 0);
     }
 
     #[test]

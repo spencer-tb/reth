@@ -1875,6 +1875,52 @@ mod tests {
         assert_eq!(sizes, [max_size, U256::ZERO], "at {gas_used}");
     }
 
+    /// As in geth, `eth_estimateGas` searches up to a request's gas limit above the block gas
+    /// limit, within the RPC gas cap, while a request that omits gas searches up to the block
+    /// gas limit.
+    #[tokio::test]
+    async fn estimate_gas_request_gas_above_block_gas_limit() {
+        const BLOCK_GAS_LIMIT: u64 = 60_000_000;
+        const GAS_CAP: u64 = 100_000_000;
+        let provider = MockEthProvider::default()
+            .with_chain_spec(ChainSpecBuilder::mainnet().amsterdam_activated().build());
+        provider.add_block(
+            B256::repeat_byte(0x42),
+            Block {
+                header: Header {
+                    number: 1,
+                    gas_limit: BLOCK_GAS_LIMIT,
+                    excess_blob_gas: Some(0),
+                    ..Default::default()
+                },
+                body: BlockBody::default(),
+            },
+        );
+        let api = build_test_eth_api_with_gas_cap(provider, GAS_CAP);
+        // Creates two contracts of 24,576 zero bytes each, which needs about 76M gas, see
+        // `estimate_gas_two_max_size_creations_amsterdam`.
+        let deployment =
+            TransactionRequest::default().with_from(Address::repeat_byte(0x11)).with_deploy_code(
+                alloy_primitives::bytes!("656160006000f36000526006601a6000f0506006601a6000f05000"),
+            );
+        let at = BlockId::latest();
+
+        let gas = EthCall::estimate_gas_at(
+            &api,
+            deployment.clone().with_gas_limit(GAS_CAP),
+            at,
+            EvmOverrides::default(),
+        )
+        .await
+        .unwrap();
+        assert!(gas > U256::from(BLOCK_GAS_LIMIT), "{gas}");
+        assert!(gas <= U256::from(GAS_CAP), "{gas}");
+
+        let gas =
+            EthCall::estimate_gas_at(&api, deployment, at, EvmOverrides::default()).await.unwrap();
+        assert!(gas <= U256::from(BLOCK_GAS_LIMIT), "{gas}");
+    }
+
     /// `eth_call`, `eth_estimateGas` and `eth_simulateV1` never cap a call that sets its gas below
     /// the block gas limit, so a transaction that fits in the block can be executed even when the
     /// RPC gas cap is lower. Calls that omit gas keep the cap as their default, and a block

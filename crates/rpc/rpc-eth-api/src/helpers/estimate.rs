@@ -41,6 +41,7 @@ pub trait EstimateCall: Call {
     ///  - `disable_eip3607` is set to `true`
     ///  - `disable_base_fee` is set to `true`
     ///  - `disable_fee_charge` is set to `true`
+    ///  - `disable_block_gas_limit` is set to `true`
     ///  - `nonce` is set to `None`
     fn estimate_gas_with<S>(
         &self,
@@ -66,6 +67,9 @@ pub trait EstimateCall: Call {
         evm_env.version_mut().features.remove(
             EvmFeatures::FEE_CHARGE | EvmFeatures::BALANCE_CHECK | EvmFeatures::BALANCE_TOP_UP,
         );
+
+        // A request's gas limit may be above the block gas limit, see below.
+        evm_env.version_mut().features.remove(EvmFeatures::BLOCK_GAS_LIMIT_CHECK);
 
         // set nonce to None so that the correct nonce is chosen by the EVM
         request.as_mut().take_nonce();
@@ -96,8 +100,15 @@ pub trait EstimateCall: Call {
 
         // the gas limit of the corresponding block
         let block_gas_limit = evm_env.block_env().gas_limit.to::<u64>();
+        // As in geth, the search starts from the request's gas limit when it can pay for a
+        // transaction, even above the block gas limit, and from the block gas limit otherwise.
+        let request_gas_limit = tx_request_gas_limit.filter(|gas| *gas >= MIN_TRANSACTION_GAS);
         // If EIP-8037 is enabled, the transaction gas limit cap is not applicable
-        let mut max_gas_limit = evm_env.version().tx_gas_caps().0.min(block_gas_limit);
+        let mut max_gas_limit = evm_env
+            .version()
+            .tx_gas_caps()
+            .0
+            .min(block_gas_limit.max(request_gas_limit.unwrap_or_default()));
 
         // Also bound diagnostic retries by the RPC gas cap, which never limits the search below
         // the block gas limit. Zero means unlimited.
@@ -106,8 +117,7 @@ pub trait EstimateCall: Call {
             max_gas_limit = max_gas_limit.min(gas_cap);
         }
 
-        let mut highest_gas_limit =
-            tx_request_gas_limit.unwrap_or(max_gas_limit).min(max_gas_limit);
+        let mut highest_gas_limit = request_gas_limit.unwrap_or(block_gas_limit).min(max_gas_limit);
 
         // Check if this is a basic transfer (no input data to account with no code)
         let is_basic_transfer = if request.as_ref().input().is_none_or(|input| input.is_empty()) &&

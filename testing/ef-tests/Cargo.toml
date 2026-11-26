@@ -50,6 +50,7 @@ reth-payload-builder.workspace = true
 reth-primitives-traits = { workspace = true, features = ["rayon"] }
 reth-provider = { workspace = true, features = ["test-utils"] }
 reth-prune.workspace = true
+reth-rpc.workspace = true
 reth-rpc-api.workspace = true
 reth-rpc-engine-api.workspace = true
 reth-stages-api.workspace = true

@@ -12,7 +12,12 @@ fn stdout(args: &[&str]) -> String {
 #[test]
 fn version_is_one_line_naming_the_runner() {
     let expected = format!("ef-test-runner {}", env!("CARGO_PKG_VERSION"));
-    for args in [&["--version"][..], &["blocktest", "--version"], &["enginetest", "--version"]] {
+    for args in [
+        &["--version"][..],
+        &["blocktest", "--version"],
+        &["enginetest", "--version"],
+        &["buildtest", "--version"],
+    ] {
         let stdout = stdout(args);
         assert_eq!(stdout.lines().count(), 1, "{args:?}: {stdout:?}");
         assert!(stdout.starts_with(&expected), "{args:?}: {stdout:?}");

@@ -149,6 +149,27 @@ pub struct FixtureResult {
     /// Every block or payload the client rejected, in fixture order, whether or not the fixture
     /// expected it.
     pub rejections: Vec<Rejection>,
+    /// The number of payloads the client built, for build tests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub built: Option<usize>,
+    /// Every field in which a built payload differs from the fixture's, in fixture order, for
+    /// build tests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mismatches: Option<Vec<Mismatch>>,
+}
+
+/// A field in which a payload the client built differs from the fixture's, with both values as
+/// they appear in the payload's JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Mismatch {
+    /// The payload's position in the fixture's `engineNewPayloads`.
+    pub index: usize,
+    /// The field's name in the payload JSON, or `executionRequests`.
+    pub field: String,
+    /// The fixture's value.
+    pub expected: serde_json::Value,
+    /// The built payload's value.
+    pub got: serde_json::Value,
 }
 
 /// A block or payload the client rejected, with the client's own error, so that a consumer can
@@ -177,6 +198,8 @@ impl FixtureResult {
             last_payload_status: None,
             error,
             rejections: Vec::new(),
+            built: None,
+            mismatches: None,
         }
     }
 

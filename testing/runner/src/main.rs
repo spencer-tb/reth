@@ -45,6 +45,10 @@ pub struct TestRunnerCommand {
 }
 
 #[derive(Debug, Subcommand)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "named after the blocktest, enginetest and buildtest commands"
+)]
 enum Command {
     /// Run blockchain tests by importing their blocks. Exits 1 if any fixture fails, and 2 if no
     /// fixture ran, a path cannot be read, or a fixture file cannot be loaded.
@@ -56,6 +60,13 @@ enum Command {
     /// cannot be loaded.
     #[command(name = "enginetest", display_name = "ef-test-runner")]
     EngineTest(EngineTestArgs),
+    /// Run blockchain tests in the engine format as `enginetest` does, first building each payload
+    /// a fixture expects to be valid through reth's `testing_buildBlockV1` handler and comparing
+    /// it with the fixture's. Payloads a fixture expects to be invalid are skipped. Exits 1 if any
+    /// fixture fails, and 2 if no fixture ran, a path cannot be read, or a fixture file cannot be
+    /// loaded.
+    #[command(name = "buildtest", display_name = "ef-test-runner")]
+    BuildTest(BuildTestArgs),
 }
 
 #[derive(Debug, Args)]
@@ -98,6 +109,23 @@ struct EngineTestArgs {
     storage: StorageArgs,
 }
 
+/// The arguments of `buildtest`, which builds blocks on reth's sequential payload builder, so it
+/// takes none of the BAL flags.
+#[derive(Debug, Args)]
+struct BuildTestArgs {
+    /// Fixture files, or directories searched for fixture files, all run in one process.
+    #[arg(required = true)]
+    paths: Vec<PathBuf>,
+    /// Print each fixture's verdict and full error to stderr as soon as it finishes.
+    #[arg(long)]
+    progress: bool,
+    /// How many fixture files run at once.
+    #[arg(long, default_value_t = default_workers())]
+    workers: usize,
+    #[command(flatten)]
+    storage: StorageArgs,
+}
+
 /// Returns the storage settings a node writes with the genesis of a new database.
 const fn storage_settings(storage: StorageArgs) -> StorageSettings {
     if storage.v2 {
@@ -129,12 +157,12 @@ fn main() {
         return
     };
 
-    let args = match &command {
+    let (bal_report, progress) = match &command {
         Command::BlockTest(BlockTestArgs { run, .. }) |
-        Command::EngineTest(EngineTestArgs { run, .. }) => run,
+        Command::EngineTest(EngineTestArgs { run, .. }) => (run.bal_report, run.progress),
+        Command::BuildTest(args) => (false, args.progress),
     };
-    report::init(args.bal_report);
-    let progress = args.progress;
+    report::init(bal_report);
     let results = Mutex::new(Vec::new());
     let load_failed = AtomicBool::new(false);
     let on_result = |result: Result<FixtureResult, Error>| {
@@ -173,6 +201,18 @@ fn main() {
                 storage_settings(storage),
                 args.workers,
                 &on_result,
+                false,
+            )
+        }
+        Command::BuildTest(args) => {
+            let files = checked_fixture_files(&args.paths, "blockchain_tests_engine");
+            engine_test::run_fixtures(
+                files,
+                false,
+                storage_settings(args.storage),
+                args.workers,
+                &on_result,
+                true,
             )
         }
     };
@@ -244,5 +284,20 @@ mod tests {
         assert_eq!(settings(&[]), StorageSettings::v2());
         assert_eq!(settings(&["--storage.v2"]), StorageSettings::v2());
         assert_eq!(settings(&["--storage.v2=false"]), StorageSettings::v1());
+    }
+
+    #[test]
+    fn buildtest_takes_no_bal_flags() {
+        let parse = |args: &[&str]| {
+            TestRunnerCommand::try_parse_from(
+                ["ef-test-runner", "buildtest", "fixtures"].iter().chain(args),
+            )
+        };
+        let cmd = parse(&["--workers", "3", "--progress"]).unwrap();
+        let Some(Command::BuildTest(args)) = cmd.command else { panic!("{cmd:?}") };
+        assert_eq!((args.workers, args.progress), (3, true));
+        for flag in ["--bal-sequential", "--bal-withhold", "--bal-report"] {
+            assert!(parse(&[flag]).is_err(), "{flag}");
+        }
     }
 }

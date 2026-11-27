@@ -109,8 +109,9 @@ struct EngineTestArgs {
     storage: StorageArgs,
 }
 
-/// The arguments of `buildtest`, which builds blocks on reth's sequential payload builder, so it
-/// takes none of the BAL flags.
+/// The arguments of `buildtest`. It takes none of the BAL flags, as the client test runner
+/// interface specifies: reth derives each access list itself while building, and the imports run
+/// on the default executor.
 #[derive(Debug, Args)]
 struct BuildTestArgs {
     /// Fixture files, or directories searched for fixture files, all run in one process.

@@ -5,7 +5,8 @@
 //! the [`EngineApi`] handler. The fixture's parameters go, unchanged, through the handler's
 //! JSON-RPC method table for `engine_newPayloadV<n>` and `engine_forkchoiceUpdatedV<n>` at the
 //! versions the fixture names, so the handler's own parameter decoding and version checks run.
-//! No node, RPC server or network is started.
+//! A build test also builds each valid payload through the [`TestingApi`] handler, the code
+//! serving `testing_buildBlockV1`, on the same chain. No node, RPC server or network is started.
 
 use crate::{
     case::{load_json, run_workers},
@@ -13,6 +14,7 @@ use crate::{
     result::{FixtureResult, Mismatch, Rejection},
     Error,
 };
+use alloy_eips::eip1559::ETHEREUM_BLOCK_GAS_LIMIT_36M;
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ClientCode, ClientVersionV1};
 use futures::StreamExt;
@@ -460,6 +462,7 @@ impl Engine {
                 evm_config.clone(),
             )
             .task_spawner(runtime.clone())
+            .blocking_task_pool(runtime.rpc_pool().clone())
             .build();
             let evm_config = evm_config.clone();
             let engine_handle = ConsensusEngineHandle::new(to_engine.clone());
@@ -600,7 +603,8 @@ async fn drive(
             if !valid {
                 continue
             }
-            build_payload(testing, idx, payload, outcome).await?;
+            let build = outcome.build.as_mut().expect("a build test has a build outcome");
+            build_payload(testing, idx, payload, build, &mut outcome.rejections).await?;
         }
         new_payload(rpc, idx, payload, outcome).await?;
         if valid {
@@ -621,7 +625,8 @@ async fn build_payload(
     testing: &TestingModule,
     index: usize,
     payload: &EngineNewPayload,
-    outcome: &mut Outcome,
+    build: &mut BuildOutcome,
+    rejections: &mut Vec<Rejection>,
 ) -> Result<(), Error> {
     let want = &payload.params[0];
     let field = |name: &str| want.get(name).cloned().unwrap_or(Value::Null);
@@ -652,19 +657,21 @@ async fn build_payload(
     }
     // The slot number and the gas limit target are attributes from forkchoiceUpdatedV4 on. Before,
     // the builder's own gas target is the payload's gas limit, which a valid payload reaches in one
-    // step.
-    if forkchoice_updated_version >= 4 {
+    // step. From V4 on the builder keeps a default target, so only `targetGasLimit` can reach it.
+    let desired_gas_limit = if forkchoice_updated_version >= 4 {
         attributes["slotNumber"] = field("slotNumber");
         attributes["targetGasLimit"] = field("gasLimit");
-    }
+        ETHEREUM_BLOCK_GAS_LIMIT_36M
+    } else {
+        gas_limit
+    };
     let params =
         json!([field("parentHash"), attributes, field("transactions"), field("extraData")]);
 
-    let build = outcome.build.get_or_insert_default();
-    let built = match call(&testing(gas_limit), "testing_buildBlockV1", params).await? {
+    let built = match call(&testing(desired_gas_limit), "testing_buildBlockV1", params).await? {
         Ok(built) => built,
         Err(err) => {
-            outcome.rejections.push(Rejection { index, hash: None, error: err.to_string() });
+            rejections.push(Rejection { index, hash: None, error: err.to_string() });
             build.refused += 1;
             return Ok(())
         }
@@ -1011,20 +1018,68 @@ mod tests {
     }
 
     #[test]
-    fn built_payload_mismatch_is_reported() {
+    fn built_payload_mismatch_alone_fails_the_fixture() {
         let (mut test, block_hash) = empty_block_fixture(None);
         test.lastblockhash = block_hash;
-        // Reth builds a payload with this extra data, a block other than the fixture's.
-        test.engine_new_payloads[0].params[0]["extraData"] = json!("0x01");
+        // `engine_newPayloadV1` ignores the field, so the payload still imports, and the built
+        // payload, an `ExecutionPayloadV3`, has `0x0` there.
+        test.engine_new_payloads[0].params[0]["blobGasUsed"] = json!("0x1");
 
         let result = build(&test);
         assert!(!result.pass);
+        assert!(result.error.contains("mismatched fields"), "{}", result.error);
         assert_eq!(result.built, Some(1));
+        assert_eq!(result.rejections, []);
+        assert_eq!(result.last_payload_status.as_deref(), Some("VALID"));
+        assert_eq!(result.last_block_hash, Some(block_hash));
         let mismatches = result.mismatches.unwrap();
-        let fields: Vec<_> = mismatches.iter().map(|mismatch| mismatch.field.as_str()).collect();
-        assert_eq!(fields, ["blockHash"], "{mismatches:?}");
-        assert_eq!(mismatches[0].index, 0);
-        assert_eq!(mismatches[0].expected, json!(block_hash));
+        assert_eq!(
+            mismatches,
+            [Mismatch {
+                index: 0,
+                field: "blobGasUsed".into(),
+                expected: json!("0x1"),
+                got: json!("0x0")
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_build_is_a_rejection_and_the_payload_still_imports() {
+        let mut rpc = RpcModule::new(());
+        rpc.register_async_method("engine_forkchoiceUpdatedV1", |_, _| async {
+            Ok::<_, jsonrpsee::types::ErrorObjectOwned>(
+                json!({"payloadStatus": {"status": "VALID"}}),
+            )
+        })
+        .unwrap();
+        rpc.register_async_method("engine_newPayloadV1", |_, _| async {
+            Ok::<_, jsonrpsee::types::ErrorObjectOwned>(json!({"status": "VALID"}))
+        })
+        .unwrap();
+        let testing: TestingModule = Box::new(|_| {
+            let mut module = RpcModule::new(());
+            module
+                .register_async_method("testing_buildBlockV1", |_, _| async {
+                    Err::<Value, _>(jsonrpsee::types::ErrorObjectOwned::owned(
+                        -32000, "refused", None::<()>,
+                    ))
+                })
+                .unwrap();
+            module
+        });
+        let (test, _) = empty_block_fixture(None);
+        let mut outcome = Outcome { build: Some(BuildOutcome::default()), ..Default::default() };
+
+        drive(&rpc, Some(&testing), &test, &mut outcome).await.unwrap();
+
+        let build = outcome.build.unwrap();
+        assert_eq!((build.built, build.refused), (0, 1));
+        assert_eq!(
+            outcome.rejections,
+            [Rejection { index: 0, hash: None, error: "-32000: refused".into() }]
+        );
+        assert_eq!(outcome.last_payload_status.as_deref(), Some("VALID"));
     }
 
     #[test]

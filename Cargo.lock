@@ -3519,6 +3519,7 @@ dependencies = [
  "reth-primitives-traits",
  "reth-provider",
  "reth-prune",
+ "reth-rpc",
  "reth-rpc-api",
  "reth-rpc-engine-api",
  "reth-stages-api",

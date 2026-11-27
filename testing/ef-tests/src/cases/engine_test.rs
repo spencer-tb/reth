@@ -5,14 +5,16 @@
 //! the [`EngineApi`] handler. The fixture's parameters go, unchanged, through the handler's
 //! JSON-RPC method table for `engine_newPayloadV<n>` and `engine_forkchoiceUpdatedV<n>` at the
 //! versions the fixture names, so the handler's own parameter decoding and version checks run.
-//! No node, RPC server or network is started.
+//! A build test also builds each valid payload through the [`TestingApi`] handler, the code
+//! serving `testing_buildBlockV1`, on the same chain. No node, RPC server or network is started.
 
 use crate::{
     case::{load_json, run_workers},
     models::{EngineNewPayload, EngineTest},
-    result::{FixtureResult, Rejection},
+    result::{FixtureResult, Mismatch, Rejection},
     Error,
 };
+use alloy_eips::eip1559::ETHEREUM_BLOCK_GAS_LIMIT_36M;
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ClientCode, ClientVersionV1};
 use futures::StreamExt;
@@ -49,7 +51,8 @@ use reth_provider::{
     BlockNumReader, ProviderFactory, StorageSettings,
 };
 use reth_prune::{PruneModes, PrunerBuilder};
-use reth_rpc_api::EngineApiServer;
+use reth_rpc::{EthApiBuilder, TestingApi};
+use reth_rpc_api::{EngineApiServer, TestingApiServer};
 use reth_rpc_engine_api::{EngineApi, EngineCapabilities};
 use reth_stages_api::Pipeline;
 use reth_static_file::StaticFileProducer;
@@ -91,12 +94,17 @@ const ENGINE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// without creating a fixture result. Each datadir is created in the temporary directory
 /// (`TMPDIR`), where a tmpfs avoids disk syncs, and its genesis is written with `storage_settings`.
 /// Returns an error if the fixture engines cannot be cleaned up completely.
+///
+/// With `build`, each payload a fixture expects to be valid is first built through reth's
+/// `testing_buildBlockV1` handler on the payload's parent and compared with the fixture's, and the
+/// payloads it expects to be invalid are skipped.
 pub fn run_fixtures(
     files: Vec<PathBuf>,
     bal_sequential: bool,
     storage_settings: StorageSettings,
     workers: usize,
     on_result: &(dyn Fn(Result<FixtureResult, Error>) + Sync),
+    build: bool,
 ) -> Result<(), Error> {
     let tree_config = tree_config(bal_sequential);
     let datadir_root = std::env::temp_dir();
@@ -121,7 +129,7 @@ pub fn run_fixtures(
             };
             for (name, test) in tests {
                 let (result, remains) =
-                    run_fixture(name, &test, &tree_config, storage_settings, &datadir_root);
+                    run_fixture(name, &test, &tree_config, storage_settings, &datadir_root, build);
                 on_result(Ok(result));
                 if let Err(err) = cleanup.push(remains) {
                     record_error(err);
@@ -157,7 +165,22 @@ struct Outcome {
     last_block_hash: Option<B256>,
     last_payload_status: Option<String>,
     rejections: Vec<Rejection>,
+    /// What reth built, for a build test only.
+    build: Option<BuildOutcome>,
 }
+
+/// The payloads reth built and refused to build in a build test, and every field of a fixture's
+/// payload in which the built one differs.
+#[derive(Debug, Default)]
+struct BuildOutcome {
+    built: usize,
+    refused: usize,
+    mismatches: Vec<Mismatch>,
+}
+
+/// Creates the `testing_` JSON-RPC methods of reth's [`TestingApi`] handler, building toward the
+/// given gas limit when the payload attributes name none, as they do before Amsterdam.
+type TestingModule = Box<dyn Fn(u64) -> RpcModule<()> + Send + Sync>;
 
 /// What a fixture leaves behind: its runtime, on which the engine's background tasks can run
 /// for seconds after the tree stopped, its databases and its datadir.
@@ -268,9 +291,10 @@ fn run_fixture(
     tree_config: &TreeConfig,
     storage_settings: StorageSettings,
     datadir_root: &Path,
+    build: bool,
 ) -> (FixtureResult, Remains) {
     let fork = format!("{:?}", test.network);
-    let mut outcome = Outcome::default();
+    let mut outcome = Outcome { build: build.then(BuildOutcome::default), ..Default::default() };
     let runtime = Runtime::test();
     let mut remains = Remains { runtime: runtime.clone(), databases: None, datadir: None };
     let result = runtime.handle().block_on(run_case(
@@ -287,6 +311,10 @@ fn run_fixture(
     let mut result = FixtureResult::new(name, fork, result).with_rejections(outcome.rejections);
     result.last_block_hash = outcome.last_block_hash;
     result.last_payload_status = outcome.last_payload_status;
+    if let Some(build) = outcome.build {
+        result.built = Some(build.built);
+        result.mismatches = Some(build.mismatches);
+    }
     (result, remains)
 }
 
@@ -316,14 +344,25 @@ async fn run_case(
         .map_err(|err| Error::Io { path: datadir_root.to_path_buf(), error: err })?
         .keep();
     remains.datadir = Some(datadir.clone());
-    let engine = Engine::start(chain_spec, &datadir, tree_config, storage_settings, runtime)?;
-    let result = drive(&engine.rpc, test, outcome).await;
+    let build = outcome.build.is_some();
+    let engine =
+        Engine::start(chain_spec, &datadir, tree_config, storage_settings, runtime, build)?;
+    let result = drive(&engine.rpc, engine.testing.as_ref(), test, outcome).await;
     let head = engine.provider.chain_info().map(|info| info.best_hash);
     let (databases, shutdown) = engine.stop().await;
     remains.databases = Some(databases);
     outcome.last_block_hash = Some(head?);
     result?;
     shutdown?;
+    if let Some(build) =
+        outcome.build.as_ref().filter(|build| !build.mismatches.is_empty() || build.refused > 0)
+    {
+        return Err(Error::Assertion(format!(
+            "{} mismatched fields, {} refused payloads",
+            build.mismatches.len(),
+            build.refused
+        )))
+    }
 
     match outcome.last_block_hash {
         Some(hash) if hash == test.lastblockhash => Ok(()),
@@ -340,6 +379,8 @@ async fn run_case(
 struct Engine {
     /// The `engine_` JSON-RPC methods of the [`EngineApi`] handler.
     rpc: RpcModule<()>,
+    /// For a build test, the `testing_` methods of the [`TestingApi`] handler on the same chain.
+    testing: Option<TestingModule>,
     provider: BlockchainProvider<FixtureNode>,
     databases: Databases,
     handler: tokio::task::JoinHandle<()>,
@@ -353,6 +394,7 @@ impl Engine {
         tree_config: &TreeConfig,
         storage_settings: StorageSettings,
         runtime: &Runtime,
+        build: bool,
     ) -> Result<Self, Error> {
         let db = Arc::new(
             init_db(
@@ -410,6 +452,31 @@ impl Engine {
         let payload_builder = PayloadBuilderHandle::<EthEngineTypes>::noop();
         let (to_engine, from_api) = tokio::sync::mpsc::unbounded_channel();
         let (sync_metrics_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        // Wired as the node wires its testing namespace, over the same provider, EVM and runtime,
+        // with no transaction pool or network: a build test always names a block's transactions.
+        let testing = build.then(|| {
+            let eth_api = EthApiBuilder::new(
+                provider.clone(),
+                NoopTransactionPool::default(),
+                NoopNetwork::default(),
+                evm_config.clone(),
+            )
+            .task_spawner(runtime.clone())
+            .blocking_task_pool(runtime.rpc_pool().clone())
+            .build();
+            let evm_config = evm_config.clone();
+            let engine_handle = ConsensusEngineHandle::new(to_engine.clone());
+            Box::new(move |desired_gas_limit: u64| {
+                TestingApi::new(
+                    eth_api.clone(),
+                    evm_config.clone(),
+                    desired_gas_limit,
+                    engine_handle.clone(),
+                )
+                .into_rpc()
+                .remove_context()
+            }) as TestingModule
+        });
         // Built as the node's engine launcher builds it. A fixture's payloads extend blocks the
         // engine already has, so nothing is downloaded or backfilled: the block client is a no-op
         // and the backfill pipeline has no stages.
@@ -476,14 +543,22 @@ impl Engine {
         );
 
         let databases = Databases { mdbx: db, rocksdb };
-        Ok(Self { rpc: api.into_rpc().remove_context(), provider, databases, handler, to_handler })
+        Ok(Self {
+            rpc: api.into_rpc().remove_context(),
+            testing,
+            provider,
+            databases,
+            handler,
+            to_handler,
+        })
     }
 
     /// Asks the engine tree to persist its blocks and stop, as a node does on shutdown, and
     /// returns the databases, which background tasks may still hold.
     async fn stop(self) -> (Databases, Result<(), Error>) {
-        let Self { rpc, provider, databases, handler, to_handler } = self;
+        let Self { rpc, testing, provider, databases, handler, to_handler } = self;
         drop(rpc);
+        drop(testing);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let shutdown = if to_handler.send(FromOrchestrator::Terminate { tx }).is_ok() {
             match tokio::time::timeout(ENGINE_SHUTDOWN_TIMEOUT, rx).await {
@@ -509,14 +584,30 @@ impl Engine {
 
 /// Sends the fixture's payloads in order, each valid one followed by a forkchoice update that
 /// makes it the head, as a consensus client would.
-async fn drive(rpc: &RpcModule<()>, test: &EngineTest, outcome: &mut Outcome) -> Result<(), Error> {
+///
+/// With `testing`, a build test, each payload expected to be valid is first built and compared
+/// with the fixture's, and the payloads expected to be invalid are neither built nor sent.
+async fn drive(
+    rpc: &RpcModule<()>,
+    testing: Option<&TestingModule>,
+    test: &EngineTest,
+    outcome: &mut Outcome,
+) -> Result<(), Error> {
     let Some(first) = test.engine_new_payloads.first() else { return Ok(()) };
     forkchoice_updated(rpc, &first.forkchoice_updated_version, test.genesis_block_header.hash)
         .await?;
 
     for (idx, payload) in test.engine_new_payloads.iter().enumerate() {
+        let valid = payload.validation_error.is_none() && payload.error_code.is_none();
+        if let Some(testing) = testing {
+            if !valid {
+                continue
+            }
+            let build = outcome.build.as_mut().expect("a build test has a build outcome");
+            build_payload(testing, idx, payload, build, &mut outcome.rejections).await?;
+        }
         new_payload(rpc, idx, payload, outcome).await?;
-        if payload.validation_error.is_none() && payload.error_code.is_none() {
+        if valid {
             let head = payload.params[0]["blockHash"].as_str().unwrap_or_default();
             let head = head.parse().map_err(|err| {
                 Error::Assertion(format!("payload {idx}: invalid blockHash {head:?}: {err}"))
@@ -525,6 +616,107 @@ async fn drive(rpc: &RpcModule<()>, test: &EngineTest, outcome: &mut Outcome) ->
         }
     }
     Ok(())
+}
+
+/// Builds payload `index`'s block through `testing_buildBlockV1` on the payload's parent and from
+/// its attributes, transactions and extra data, and records every field of the fixture's payload
+/// in which the built one differs. A build reth refuses is a rejection.
+async fn build_payload(
+    testing: &TestingModule,
+    index: usize,
+    payload: &EngineNewPayload,
+    build: &mut BuildOutcome,
+    rejections: &mut Vec<Rejection>,
+) -> Result<(), Error> {
+    let want = &payload.params[0];
+    let field = |name: &str| want.get(name).cloned().unwrap_or(Value::Null);
+    let version = |version: &str| {
+        version.parse::<u64>().map_err(|err| Error::engine("invalid fixture method version", err))
+    };
+    let new_payload_version = version(&payload.new_payload_version)?;
+    let forkchoice_updated_version = version(&payload.forkchoice_updated_version)?;
+    let gas_limit = field("gasLimit");
+    let gas_limit = gas_limit
+        .as_str()
+        .and_then(|hex| u64::from_str_radix(hex.trim_start_matches("0x"), 16).ok())
+        .ok_or_else(|| {
+            Error::Assertion(format!("payload {index}: invalid gasLimit {gas_limit}"))
+        })?;
+
+    let mut attributes = json!({
+        "timestamp": field("timestamp"),
+        "prevRandao": field("prevRandao"),
+        "suggestedFeeRecipient": field("feeRecipient"),
+    });
+    if !field("withdrawals").is_null() {
+        attributes["withdrawals"] = field("withdrawals");
+    }
+    // The parent beacon block root is a newPayload param from V3 on.
+    if new_payload_version >= 3 {
+        attributes["parentBeaconBlockRoot"] = payload.params[2].clone();
+    }
+    // The slot number and the gas limit target are attributes from forkchoiceUpdatedV4 on. Before,
+    // the builder's own gas target is the payload's gas limit, which a valid payload reaches in one
+    // step. From V4 on the builder keeps a default target, so only `targetGasLimit` can reach it.
+    let desired_gas_limit = if forkchoice_updated_version >= 4 {
+        attributes["slotNumber"] = field("slotNumber");
+        attributes["targetGasLimit"] = field("gasLimit");
+        ETHEREUM_BLOCK_GAS_LIMIT_36M
+    } else {
+        gas_limit
+    };
+    let params =
+        json!([field("parentHash"), attributes, field("transactions"), field("extraData")]);
+
+    let built = match call(&testing(desired_gas_limit), "testing_buildBlockV1", params).await? {
+        Ok(built) => built,
+        Err(err) => {
+            rejections.push(Rejection { index, hash: None, error: err.to_string() });
+            build.refused += 1;
+            return Ok(())
+        }
+    };
+    build.built += 1;
+    // Only the fixture's fields: `testing_buildBlockV1` returns an `ExecutionPayloadV3` for any
+    // block before Amsterdam, so a block before Cancun comes back with Cancun's fields, and the
+    // block hash already covers the header reth built.
+    let got = &built["executionPayload"];
+    for (name, expected) in want.as_object().into_iter().flatten() {
+        compare(index, name, expected, got.get(name).unwrap_or(&Value::Null), build);
+    }
+    // The execution requests are a newPayload param from V4 on.
+    if new_payload_version >= 4 {
+        compare(index, "executionRequests", &payload.params[3], &built["executionRequests"], build);
+    }
+    Ok(())
+}
+
+/// Records a mismatch when the fixture's value of `field` and the built one differ as JSON values.
+fn compare(index: usize, field: &str, expected: &Value, got: &Value, build: &mut BuildOutcome) {
+    if !json_equals(expected, got) {
+        build.mismatches.push(Mismatch {
+            index,
+            field: field.to_string(),
+            expected: expected.clone(),
+            got: got.clone(),
+        });
+    }
+}
+
+/// Compares two JSON values as values rather than text: a missing field equals null, objects
+/// compare by their fields in any order, and strings, which carry the payload's hex, compare
+/// regardless of case.
+fn json_equals(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Object(a), Value::Object(b)) => a.keys().chain(b.keys()).all(|key| {
+            json_equals(a.get(key).unwrap_or(&Value::Null), b.get(key).unwrap_or(&Value::Null))
+        }),
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| json_equals(a, b))
+        }
+        (Value::String(a), Value::String(b)) => a.eq_ignore_ascii_case(b),
+        _ => a == b,
+    }
 }
 
 /// A JSON-RPC error returned by the handler.
@@ -735,6 +927,15 @@ mod tests {
 
     /// Runs a fixture as a worker does and checks that its datadir is removed.
     fn run(test: &EngineTest) -> FixtureResult {
+        run_as(test, false)
+    }
+
+    /// Runs a fixture as a build test worker does and checks that its datadir is removed.
+    fn build(test: &EngineTest) -> FixtureResult {
+        run_as(test, true)
+    }
+
+    fn run_as(test: &EngineTest, build: bool) -> FixtureResult {
         let datadir_root = tempfile::tempdir().unwrap();
         let (result, remains) = run_fixture(
             "test".to_string(),
@@ -742,6 +943,7 @@ mod tests {
             &tree_config(false),
             StorageSettings::base(),
             datadir_root.path(),
+            build,
         );
         let mut cleanup = Cleanup::default();
         cleanup.remains.push(remains);
@@ -765,6 +967,7 @@ mod tests {
                     &tree_config(false),
                     storage_settings,
                     &runtime,
+                    false,
                 )
                 .unwrap();
                 let stored =
@@ -797,6 +1000,109 @@ mod tests {
         assert_eq!(result.last_block_hash, Some(block_hash));
         assert_eq!(result.last_payload_status.as_deref(), Some("VALID"));
         assert_eq!(result.rejections, []);
+        assert_eq!(result.built, None);
+        assert_eq!(result.mismatches, None);
+    }
+
+    #[test]
+    fn built_payload_matches_the_fixture() {
+        let (mut test, block_hash) = empty_block_fixture(None);
+        test.lastblockhash = block_hash;
+
+        let result = build(&test);
+        assert!(result.pass, "{}: {:?}", result.error, result.mismatches);
+        assert_eq!(result.built, Some(1));
+        assert_eq!(result.mismatches, Some(Vec::new()));
+        assert_eq!(result.last_block_hash, Some(block_hash));
+        assert_eq!(result.rejections, []);
+    }
+
+    #[test]
+    fn built_payload_mismatch_alone_fails_the_fixture() {
+        let (mut test, block_hash) = empty_block_fixture(None);
+        test.lastblockhash = block_hash;
+        // `engine_newPayloadV1` ignores the field, so the payload still imports, and the built
+        // payload, an `ExecutionPayloadV3`, has `0x0` there.
+        test.engine_new_payloads[0].params[0]["blobGasUsed"] = json!("0x1");
+
+        let result = build(&test);
+        assert!(!result.pass);
+        assert!(result.error.contains("mismatched fields"), "{}", result.error);
+        assert_eq!(result.built, Some(1));
+        assert_eq!(result.rejections, []);
+        assert_eq!(result.last_payload_status.as_deref(), Some("VALID"));
+        assert_eq!(result.last_block_hash, Some(block_hash));
+        let mismatches = result.mismatches.unwrap();
+        assert_eq!(
+            mismatches,
+            [Mismatch {
+                index: 0,
+                field: "blobGasUsed".into(),
+                expected: json!("0x1"),
+                got: json!("0x0")
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_build_is_a_rejection_and_the_payload_still_imports() {
+        let mut rpc = RpcModule::new(());
+        rpc.register_async_method("engine_forkchoiceUpdatedV1", |_, _| async {
+            Ok::<_, jsonrpsee::types::ErrorObjectOwned>(
+                json!({"payloadStatus": {"status": "VALID"}}),
+            )
+        })
+        .unwrap();
+        rpc.register_async_method("engine_newPayloadV1", |_, _| async {
+            Ok::<_, jsonrpsee::types::ErrorObjectOwned>(json!({"status": "VALID"}))
+        })
+        .unwrap();
+        let testing: TestingModule = Box::new(|_| {
+            let mut module = RpcModule::new(());
+            module
+                .register_async_method("testing_buildBlockV1", |_, _| async {
+                    Err::<Value, _>(jsonrpsee::types::ErrorObjectOwned::owned(
+                        -32000, "refused", None::<()>,
+                    ))
+                })
+                .unwrap();
+            module
+        });
+        let (test, _) = empty_block_fixture(None);
+        let mut outcome = Outcome { build: Some(BuildOutcome::default()), ..Default::default() };
+
+        drive(&rpc, Some(&testing), &test, &mut outcome).await.unwrap();
+
+        let build = outcome.build.unwrap();
+        assert_eq!((build.built, build.refused), (0, 1));
+        assert_eq!(
+            outcome.rejections,
+            [Rejection { index: 0, hash: None, error: "-32000: refused".into() }]
+        );
+        assert_eq!(outcome.last_payload_status.as_deref(), Some("VALID"));
+    }
+
+    #[test]
+    fn invalid_payload_is_not_built() {
+        let (mut test, _) = empty_block_fixture(Some(B256::repeat_byte(1)));
+        test.lastblockhash = test.genesis_block_header.hash;
+        test.engine_new_payloads[0].validation_error = Some("state root mismatch".to_string());
+
+        let result = build(&test);
+        assert!(result.pass, "{}", result.error);
+        assert_eq!(result.built, Some(0));
+        assert_eq!(result.mismatches, Some(Vec::new()));
+        assert_eq!(result.last_payload_status, None);
+        assert_eq!(result.rejections, []);
+    }
+
+    #[test]
+    fn json_values_compare_as_values() {
+        assert!(json_equals(&json!({"a": "0xAB", "b": null}), &json!({"a": "0xab"})));
+        assert!(json_equals(&json!(["0x01", "0x02"]), &json!(["0x01", "0x02"])));
+        assert!(!json_equals(&json!(["0x01"]), &json!(["0x01", "0x02"])));
+        assert!(!json_equals(&json!({"a": "0x01"}), &json!({"a": "0x02"})));
+        assert!(!json_equals(&json!("0x01"), &Value::Null));
     }
 
     #[test]
@@ -984,6 +1290,7 @@ mod tests {
                 &tree_config(false),
                 StorageSettings::base(),
                 dir.path(),
+                false,
             );
             assert!(result.pass, "{}", result.error);
             cleanup.push(remains).unwrap();
